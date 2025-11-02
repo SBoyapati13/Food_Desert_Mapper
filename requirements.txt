@@ -5,3 +5,4 @@ osmnx
 pandas
 requests
 shapely
+streamlit-folium
