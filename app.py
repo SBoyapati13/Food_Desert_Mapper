@@ -1,7 +1,6 @@
 import streamlit as st
 import folium
 import logging
-import os
 from pathlib import Path
 from streamlit_folium import st_folium
 
@@ -39,6 +38,10 @@ GEOJSON_STYLE = {
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
 
+if "city_gdf" not in st.session_state:
+    st.session_state["city_gdf"] = None
+if "current_city" not in st.session_state:
+    st.session_state["current_city"] = None
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -162,7 +165,7 @@ def display_boundary_metrics(city_gdf) -> None:
         st.metric("Total Area", format_area(total_area))
 
 
-def display_download_section(city_name) -> None:
+def display_download_section(city_name: str) -> None:
     """
     Display GeoJSON download button.
     
@@ -208,12 +211,6 @@ st.markdown("""
     }
     </style>
     """, unsafe_allow_html=True)
-
-# Initialize session state
-if 'city_gdf' not in st.session_state:
-    st.session_state.city_gdf = None
-if 'current_city' not in st.session_state:
-    st.session_state.current_city = None
 
 
 # ============================================================================

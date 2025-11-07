@@ -1,0 +1,37 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Environment variables
+.env
+
+# VS Code settings
+.vscode/
+
+# Database files
+*.db
+*.sqlite3
+
+# Cache directories
+data/cache/
+
+# Logs
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# OSMnx cache
+*.osm
+*.osm.pbf

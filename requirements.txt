@@ -6,3 +6,6 @@ pandas
 requests
 shapely
 streamlit-folium
+psycopg2-binary
+sqlalchemy
+python-dotenv
