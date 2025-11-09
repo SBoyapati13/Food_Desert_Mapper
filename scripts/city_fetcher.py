@@ -1,26 +1,26 @@
 import osmnx as ox
 import logging
-from pathlib import Path
-from db_setup import execute_query
 from typing import Optional
-from utils import (
-    ensure_data_directory,
+
+from .db_setup import (
+    execute_query,
     validate_database_environment,
-    validate_string_input,
     check_entity_exists
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from .utils import (
+    ensure_data_directory,
+    validate_string_input
 )
+
+# Configure logging
+from .logger_config import setup_logging
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # Get project root and set OSMnx cache directory to data folder
 CACHE_DIR = ensure_data_directory() / "cache"
 ox.settings.cache_folder = str(CACHE_DIR)
-
 
 def validate_inputs(city_name: str, country_name: Optional[str] = None) -> None:
     """
@@ -50,7 +50,6 @@ def validate_inputs(city_name: str, country_name: Optional[str] = None) -> None:
         logger.info(f"City boundary for '{city_name}' already exists (last updated: {result[0][0]})")
     
     logger.info(f"Input validation passed for city_name='{city_name}', country_name='{country_name}'")
-
 
 def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
     """
