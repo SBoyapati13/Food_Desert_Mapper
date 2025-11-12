@@ -353,7 +353,7 @@ def update_stores_for_city(city_name: str, country_name: Optional[str] = None) -
             
         # Fetch and save stores
         fetcher = GroceryStoreFetcher()
-        stores = fetcher.fetch_and_save_stores(
+        fetcher.fetch_and_save_stores(
             city_gdf,
             city_name,
             country_name
