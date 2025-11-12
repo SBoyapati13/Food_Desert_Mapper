@@ -9,3 +9,5 @@ streamlit-folium
 psycopg2-binary
 sqlalchemy
 python-dotenv
+pathlib
+logging
