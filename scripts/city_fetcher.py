@@ -45,12 +45,77 @@ def validate_inputs(city_name: str, country_name: Optional[str] = None) -> None:
     
     if check_entity_exists("city_boundaries", criteria):
         result = execute_query(
-            "SELECT last_updated FROM city_boundaries WHERE city_name = %s",
-            (city_name,)
+            "SELECT last_updated FROM city_boundaries WHERE city_name = %s AND country_name IS NOT DISTINCT FROM %s",
+            (city_name, country_name)
         )
         logger.info(f"City boundary for '{city_name}' already exists (last updated: {result[0][0]})")
     
     logger.info(f"Input validation passed for city_name='{city_name}', country_name='{country_name}'")
+
+def _check_geometry_conflict(gdf: gpd.GeoDataFrame, city_name: str, country_name: Optional[str]) -> Optional[Dict]:
+    """
+    Check if the same geometry exists with different city/country names.
+    
+    Parameters:
+        gdf: GeoDataFrame containing the new boundary
+        city_name: Name of the city being saved
+        country_name: Optional country name
+        
+    Returns:
+        Optional[Dict]: Existing city info if conflict found, None otherwise
+    """
+    try:
+        geom_wkt = gdf.iloc[0].geometry.wkt
+
+        query = """
+            SELECT id, city_name, country_name 
+            FROM city_boundaries 
+            WHERE ST_Equals(boundary, ST_GeomFromText(%s, 4326))
+            AND NOT (city_name = %s AND country_name IS NOT DISTINCT FROM %s)
+        """
+        
+        result = execute_query(query, (geom_wkt, city_name, country_name))
+        
+        if result:
+            return {
+                'id': result[0][0],
+                'city_name': result[0][1],
+                'country_name': result[0][2]
+            }
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error checking geometry conflict: {e}")
+        return None
+    
+def _update_city_record(existing_id: int, new_city_name: str, new_country_name: Optional[str], gdf: gpd.GeoDataFrame) -> None:
+    """
+    Update an existing city record with new information.
+    
+    Parameters:
+        existing_id: ID of the existing city record
+        new_city_name: New city name to use
+        new_country_name: New country name to use
+        gdf: GeoDataFrame containing the boundary
+    """
+    try:
+        geom_wkt = gdf.iloc[0].geometry.wkt
+        
+        query = """
+            UPDATE city_boundaries 
+            SET city_name = %s,
+                country_name = %s,
+                boundary = ST_GeomFromText(%s, 4326),
+                last_updated = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """
+        
+        execute_query(query, (new_city_name, new_country_name, geom_wkt, existing_id))
+        logger.info(f"Updated city record {existing_id} to {new_city_name}, {new_country_name}")
+        
+    except Exception as e:
+        logger.error(f"Error updating city record: {e}")
+        raise
 
 def fetch_city_boundary(
         city_name: str, 
@@ -111,9 +176,10 @@ def fetch_city_boundary(
         
         # Fetch boundary from OpenStreetMap
         try:
-            gdf = ox.geocode_to_gdf(query, which_result=None) # Get all matches
-
-            # Check if multiple matches found
+            # FIX: Get all matches to handle properly
+            gdf = ox.geocode_to_gdf(query, which_result=None)
+            
+            # FIX: Always check if we got multiple results
             if len(gdf) > 1:
                 logger.info(f"Found {len(gdf)} matches for query '{query}'")
 
@@ -164,6 +230,26 @@ def _save_boundary_to_db(gdf: gpd.GeoDataFrame, city_name: str, country_name: Op
     try:
         geom_wkt = gdf.iloc[0].geometry.wkt
 
+        # FIX: Check for geometry conflicts
+        conflict = _check_geometry_conflict(gdf, city_name, country_name)
+        
+        if conflict:
+            # Same geometry exists with different city/country
+            logger.warning(
+                f"Geometry conflict detected: Same boundary exists as "
+                f"'{conflict['city_name']}, {conflict['country_name']}'. "
+                f"Updating to '{city_name}, {country_name}'"
+            )
+            
+            # Update the existing record with the new city/country info
+            _update_city_record(conflict['id'], city_name, country_name, gdf)
+            
+            query_str = city_name if not country_name else f"{city_name}, {country_name}"
+            logger.info(f"City boundary updated in database: {query_str}")
+            print(f"✓ Boundary for {query_str} updated in database (resolved geometry conflict)")
+            return
+
+        # No conflict - proceed with normal insert/update
         query = """
             INSERT INTO city_boundaries (city_name, country_name, boundary)
             VALUES (%s, %s, ST_GeomFromText(%s, 4326))

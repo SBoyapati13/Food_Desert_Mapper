@@ -43,7 +43,9 @@ DEFAULT_SESSION_STATE = {
     "total_stores": 0,
     "new_stores": 0,
     "available_matches": None,  # NEW: Store multiple city matches
-    "selected_osm_id": None    # NEW: Store selected OSM ID
+    "selected_osm_id": None,    # NEW: Store selected OSM ID
+    "pending_city_name": None,      # Store the city name being processed
+    "pending_country_name": None   # Store the country name being processed
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
@@ -340,7 +342,8 @@ class UserInterface:
         for i, match in enumerate(matches):
             display_name = match.get('display_name', 'Unknown')
             osm_type = match.get('osm_type', 'unknown')
-            options.append(f"{i+1}. {display_name} (OSM Type: {osm_type})")
+            place_rank = match.get('place_rank', 999)
+            options.append(f"{i+1}. {display_name} (Type: {osm_type}, Rank: {place_rank})")
         
         selected = st.radio("Select a city:", options, key="city_selectior")
         
@@ -353,6 +356,7 @@ class UserInterface:
                 st.write(f"**Full Name:** {selected_match.get('display_name', 'Unknown')}")
                 st.write(f"**Type:** {selected_match.get('osm_type', 'Unknown')}")
                 st.write(f"**OSM ID:** {selected_match.get('osm_id', 'Unknown')}")
+                st.write(f"**Place Rank:** {selected_match.get('place_rank', 'Unknown')} (lower = more specific)")
 
             if st.button("✅ Confirm Selection", type="primary"):
                 return selected_match.get('osm_id')
@@ -389,6 +393,16 @@ class UserInterface:
 
 class AppLogic:
     """Handles main application logic and state management."""
+
+    @staticmethod
+    def clear_city_state():
+        """Clear all city-related session state."""
+        st.session_state.city_gdf = None
+        st.session_state.stores_gdf = None
+        st.session_state.stores_updated = False
+        st.session_state.total_stores = 0
+        st.session_state.new_stores = 0
+        st.session_state.last_update_time = None
     
     @staticmethod
     def update_stores(
@@ -461,6 +475,8 @@ class AppLogic:
         country_name = country_name.strip() if country_name and isinstance(country_name, str) else None
         
         try:
+            AppLogic.clear_city_state()
+
             result = DataManager.load_city_boundary(city_name, country_name, osm_id)
             
             # Check if we got multiple matches
@@ -509,20 +525,40 @@ def main():
 
         # Handel city loading
         if load_button and city_name:
+            st.session_state.pending_city_name = city_name
+            st.session_state.pending_country_name = country_name
+
             with st.spinner(f"🔍 Fetching boundary for {city_name}..."):
                 city_gdf, matches = AppLogic.process_city_selection(city_name, country_name)
 
                 if matches:
-                    # Store matches for selection
-                    st.session_state.available_matches = matches
-                    st.rerun()
-                    
+                    if len(matches) > 1:
+                        st.session_state.available_matches = matches
+                        st.rerun()
+
+                    else:
+                        single_osm_id = matches[0].get('osm_id')
+                        city_gdf, _ = AppLogic.process_city_selection(
+                            city_name, 
+                            country_name, 
+                            osm_id=single_osm_id
+                        )
+
+                        if city_gdf is not None:
+                            st.success(f"✅ Successfully loaded {city_name}!")
+                            st.session_state.available_matches = None
+                            st.rerun()
+
                 elif city_gdf is not None:
                     st.success(f"✅ Successfully loaded {city_name}!")
+                    st.session_state.available_matches = None
                     st.rerun()
 
         # Handle multiple matches selection
         if st.session_state.available_matches:
+            city_name = st.session_state.pending_city_name or st.session_state.current_city
+            country_name = st.session_state.pending_country_name or st.session_state.current_country
+
             selected_osm_id = UserInterface.display_city_selection(st.session_state.available_matches)
             
             if selected_osm_id:
@@ -534,6 +570,8 @@ def main():
                     )
                     if city_gdf is not None:
                         st.success(f"✅ Successfully loaded {city_name}!")
+                        st.session_state.pending_city_name = None
+                        st.session_state.pending_country_name = None
                         st.session_state.available_matches = None
                         st.rerun()
 
@@ -565,11 +603,12 @@ def main():
                 st.info(f"📊 Showing {len(st.session_state.stores_gdf)} grocery stores")
 
             # Create and display map
+            map_key = f"map_{st.session_state.current_city}_{st.session_state.current_country}"
             m = MapManager.display_map(
                 st.session_state.city_gdf,
                 st.session_state.stores_gdf
             )
-            st_folium(m, width=700, height=500, key="main_map")
+            st_folium(m, width=700, height=500, key=map_key)
 
         elif not st.session_state.available_matches:
             UserInterface.display_welcome()

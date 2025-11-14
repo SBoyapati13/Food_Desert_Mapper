@@ -331,8 +331,20 @@ def update_stores_for_city(city_name: str, country_name: Optional[str] = None) -
     from .city_fetcher import fetch_city_boundary
     
     try:
-        # Fetch city boundary
-        city_gdf = fetch_city_boundary(city_name, country_name)
+        result = fetch_city_boundary(city_name, country_name)
+
+        if isinstance(result, tuple):
+            _, matches = result
+            raise ValueError(
+                f"Multiple matches found for '{city_name}'. "
+                f"Please use the UI to select the correct city first, or provide a country name. "
+                f"Found {len(matches)} matches."
+            )
+        
+        # Single match - it's a GeoDataFrame
+        city_gdf = result
+        if city_gdf is None or city_gdf.empty:
+            raise ValueError(f"No boundary data found for '{city_name}'")
         
         # Get existing store count
         city_id = get_entity_id(
