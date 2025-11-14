@@ -1,6 +1,7 @@
 import osmnx as ox
 import logging
-from typing import Optional
+from typing import Optional, Union, Tuple, List, Dict
+import geopandas as gpd
 
 from .db_setup import (
     execute_query,
@@ -51,7 +52,11 @@ def validate_inputs(city_name: str, country_name: Optional[str] = None) -> None:
     
     logger.info(f"Input validation passed for city_name='{city_name}', country_name='{country_name}'")
 
-def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
+def fetch_city_boundary(
+        city_name: str, 
+        country_name: Optional[str] = None,
+        osm_id: Optional[int] = None
+    ) -> Union[gpd.GeoDataFrame, Tuple[None, List[Dict]]]:
     """
     Fetches the boundary of a specified city using OpenStreetMap data via OSMnx.
     
@@ -63,9 +68,12 @@ def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
         city_name (str): The name of the city to fetch (required).
         country_name (Optional[str]): The name of the country where the city is located.
                                     Improves accuracy for ambiguous city names.
+        osm_id (Optional[int]): Specific OSM ID to fetch (bypasses search).
 
     Returns:
-        GeoDataFrame: A GeoDataFrame containing the city's boundary polygon(s).
+        Union[GeoDataFrame, Tuple[None, List[Dict]]]: 
+            - GeoDataFrame if single match found
+            - Tuple of (None, list of matches) if multiple matches found
     
     Raises:
         ValueError: If city_name or country_name are invalid.
@@ -75,7 +83,22 @@ def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
     try:
         # Validate database environment first
         validate_database_environment({'city_boundaries'})
-        
+
+        # If OSM id is provided, fetch directly
+        if osm_id:
+            logger.info(f"Fetching boundary for OSM ID: {osm_id}")
+            try:
+                gdf = ox.geocode_to_gdf(str(osm_id), by_osmid=True)
+                logger.info(f"Successfully fetched boundary for OSM ID: {osm_id}")
+
+                # Save to database
+                _save_boundary_to_db(gdf, city_name, country_name)
+                return gdf
+            
+            except Exception as e:
+                logger.error(f"Failed to fetch boundary from OpenStreetMap for OSM ID '{osm_id}': {e}")
+                raise Exception(f"Could not find city boundary for OSM ID '{osm_id}'. Please verify the ID.") from e
+
         # Validate inputs
         validate_inputs(city_name, country_name)
         
@@ -88,33 +111,39 @@ def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
         
         # Fetch boundary from OpenStreetMap
         try:
-            gdf = ox.geocode_to_gdf(query)
+            gdf = ox.geocode_to_gdf(query, which_result=None) # Get all matches
+
+            # Check if multiple matches found
+            if len(gdf) > 1:
+                logger.info(f"Found {len(gdf)} matches for query '{query}'")
+
+                # Convert matches to a list of dicts for selection
+                matches = []
+                for idx, row in gdf.iterrows():
+                    matches.append({
+                        'display_name': row.get('display_name', 'Unknown'),
+                        'osm_type': row.get('osm_type', 'Unknown'),
+                        'osm_id': row.get('osm_id', 'Unknown'),
+                        'name': row.get('name', city_name),
+                        'place_rank': row.get('place_rank', 999)
+                    })
+
+                # Sort by place_rank (lower is more specific)
+                matches.sort(key=lambda x: x.get('place_rank', 999))
+
+                return None, matches
+            
+            # Single result
             logger.info(f"Successfully fetched boundary for {query}")
+
         except Exception as e:
             logger.error(f"Failed to fetch boundary from OpenStreetMap for '{query}': {e}")
             raise Exception(f"Could not find city boundary for '{query}'. Please verify the city and country names.") from e
         
         # Save to database
-        try:
-            geom_wkt = gdf.iloc[0].geometry.wkt
-            query = """
-                INSERT INTO city_boundaries (city_name, country_name, boundary)
-                VALUES (%s, %s, ST_GeomFromText(%s, 4326))
-                ON CONFLICT (city_name, country_name) DO UPDATE
-                SET boundary = ST_GeomFromText(%s, 4326),
-                    last_updated = CURRENT_TIMESTAMP;
-            """
-            params = (city_name, country_name, geom_wkt, geom_wkt)
-            execute_query(query, params)
-            
-            logger.info(f"City boundary fetcher completed successfully for {query}")
-            print(f"✓ Boundary for {query} saved to database")
-            
-            return gdf
-            
-        except Exception as e:
-            logger.error(f"Failed to save boundary: {e}")
-            raise
+        _save_boundary_to_db(gdf, city_name, country_name)
+
+        return gdf
         
     except ValueError as e:
         logger.error(f"Input validation error: {e}")
@@ -123,9 +152,47 @@ def fetch_city_boundary(city_name: str, country_name: Optional[str] = None):
         logger.error(f"Unexpected error in fetch_city_boundary: {e}")
         raise
 
+def _save_boundary_to_db(gdf: gpd.GeoDataFrame, city_name: str, country_name: Optional[str]) -> None:
+    """
+    Helper function to save boundary to database.
+    
+    Parameters:
+        gdf: GeoDataFrame containing the boundary
+        city_name: Name of the city
+        country_name: Optional country name
+    """
+    try:
+        geom_wkt = gdf.iloc[0].geometry.wkt
+
+        query = """
+            INSERT INTO city_boundaries (city_name, country_name, boundary)
+            VALUES (%s, %s, ST_GeomFromText(%s, 4326))
+            ON CONFLICT (city_name, country_name) DO UPDATE 
+            SET boundary = ST_GeomFromText(%s, 4326),
+                last_updated = CURRENT_TIMESTAMP;
+        """
+
+        params = (city_name, country_name, geom_wkt, geom_wkt)
+        execute_query(query, params)
+
+        query_str = city_name if not country_name else f"{city_name}, {country_name}"
+        logger.info(f"City boundary for '{query_str}' saved to database successfully")
+        print(f"✓ Boundary for {query_str} saved to database")
+
+    except Exception as e:
+        logger.error(f"Failed to save boundary: {e}")
+        raise
+
 if __name__ == "__main__":
     # Example usage
     try:
-        city_boundary_gdf = fetch_city_boundary("New Brunswick", "USA")
+        result = fetch_city_boundary("New Brunswick")
+        if isinstance(result, tuple):
+            _, matches = result
+            print(f"Found {len(matches)} matches:")
+            for i, match in enumerate(matches, 1):
+                print(f"{i}. {match['display_name']}")
+        else:
+            print("Single match found and saved!")
     except Exception as e:
         logger.error(f"Error fetching city boundary: {e}")

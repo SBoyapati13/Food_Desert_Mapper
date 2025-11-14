@@ -1,22 +1,20 @@
 import streamlit as st
 import folium
 import logging
+import geopandas as gpd
+import pandas as pd
 from pathlib import Path
+from typing import Optional, Tuple, List, Union, Dict
 from streamlit_folium import st_folium
 
-# Add scripts directory to path for importing city_fetcher
-import sys
-sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-
-from city_fetcher import fetch_city_boundary
+# Import from our package
+from scripts.city_fetcher import fetch_city_boundary
+from scripts.grocery_fetcher import GroceryStoreFetcher, update_stores_for_city
+from scripts.logger_config import setup_logging
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+setup_logging()
 logger = logging.getLogger(__name__)
-
 
 # ============================================================================
 # CONSTANTS AND CONFIGURATION
@@ -30,336 +28,571 @@ MAP_CONFIG = {
 GEOJSON_STYLE = {
     'fillColor': '#3388ff',
     'color': '#003d99',
-    'weight': 2,
-    'opacity': 0.7,
-    'fillOpacity': 0.5
+    'fillOpacity': 0.2,
+    'weight': 2
 }
 
-PROJECT_ROOT = Path(__file__).parent
-DATA_DIR = PROJECT_ROOT / "data"
+# Initialize session state with default values
+DEFAULT_SESSION_STATE = {
+    "city_gdf": None,
+    "current_city": None,
+    "current_country": None,
+    "stores_gdf": None,
+    "stores_updated": False,
+    "last_update_time": None,
+    "total_stores": 0,
+    "new_stores": 0,
+    "available_matches": None,  # NEW: Store multiple city matches
+    "selected_osm_id": None    # NEW: Store selected OSM ID
+}
 
-if "city_gdf" not in st.session_state:
-    st.session_state["city_gdf"] = None
-if "current_city" not in st.session_state:
-    st.session_state["current_city"] = None
+for key, value in DEFAULT_SESSION_STATE.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 # ============================================================================
-# UTILITY FUNCTIONS
+# DATA MANAGEMENT (Base utilities for data fetching and caching)
 # ============================================================================
 
-@st.cache_data
-def load_boundary_data(city_name: str, country_name=None):
-    """
-    Load city boundary data with caching to improve performance.
+class DataManager:
+    """Handles data caching and retrieval for the application."""
     
-    Parameters:
-    city_name (str): Name of the city
-    country_name (str, optional): Name of the country
+    @staticmethod
+    @st.cache_data(ttl=300)  # Cache for 5 minutes
+    def load_city_boundary(
+        city_name: str, 
+        country_name: Optional[str] = None,
+        osm_id: Optional[int] = None
+    ) -> Union[gpd.GeoDataFrame, Tuple[None, List[Dict]]]:
+        """
+        Load city boundary data.
+        
+        Returns:
+            Either a GeoDataFrame (single match) or Tuple[None, List[Dict]] (multiple matches)
+        """
+        return fetch_city_boundary(city_name, country_name, osm_id)
     
-    Returns:
-    GeoDataFrame: The city boundary data
-    """
-    return fetch_city_boundary(city_name, country_name)
+    @staticmethod
+    @st.cache_data(ttl=300)
+    def get_all_city_stores(city_name: str, country_name: Optional[str] = None) -> gpd.GeoDataFrame:
+        """Get all stores for a given city."""
+        try:
+            fetcher = GroceryStoreFetcher()
+            city_id = fetcher._get_city_id(city_name, country_name)
 
+            if not city_id:
+                logger.warning(f"City {city_name} not found in database.")
+                return gpd.GeoDataFrame()
+            
+            from scripts.db_setup import execute_query
+            query = """
+                SELECT store_name, shop_type, ST_AsText(location) as geometry
+                FROM grocery_stores
+                WHERE city_id = %s
+            """
+            rows = execute_query(query, (city_id,))
 
-def get_cached_geojson_path(city_name: str) -> Path:
-    """
-    Get the path to a cached GeoJSON file.
-    
-    Parameters:
-    city_name (str): Name of the city
-    
-    Returns:
-    Path: Path to the GeoJSON file
-    """
-    safe_filename = city_name.replace(' ', '_').lower()
-    return DATA_DIR / f"{safe_filename}_boundary.geojson"
+            if not rows:
+                return gpd.GeoDataFrame()
+            
+            df = pd.DataFrame(rows, columns=['store_name', 'shop_type', 'geometry'])
+            gdf = gpd.GeoDataFrame(
+                df,
+                geometry=gpd.GeoSeries.from_wkt(df['geometry']),
+                crs="EPSG:4326"
+            )
 
+            return gdf
+        
+        except Exception as e:
+            logger.error(f"Error getting city stores: {e}")
+            return gpd.GeoDataFrame()
 
-def format_area(area: float) -> str:
-    """
-    Format area value with appropriate unit.
-    
-    Parameters:
-    area (float): Area value in square units
-    
-    Returns:
-    str: Formatted area string
-    """
-    if area >= 1e6:
-        return f"{area / 1e6:.2f} million sq units"
-    elif area >= 1e3:
-        return f"{area / 1e3:.2f}K sq units"
-    else:
-        return f"{area:,.2f} sq units"
+    @staticmethod
+    @st.cache_data(ttl=300, show_spinner=False)
+    def update_city_stores(city_name: str, country_name: Optional[str] = None) -> Tuple[int, int]:
+        """
+        Update store data for a city.
+        
+        Args:
+            city_name: Name of the city to update stores for
+            country_name: Optional country name for disambiguation
+            
+        Returns:
+            Tuple containing:
+            - total_stores: Total number of stores in the city
+            - new_stores: Number of newly added stores
+            
+        Note:
+            This method is cached for 5 minutes (300 seconds) to prevent
+            too frequent updates to the database. Existing stores will
+            be updated if their data has changed.
+        """
+        logger.info(f"Updating stores for {city_name} (cached for 5 minutes)")
+        return update_stores_for_city(city_name, country_name)
 
+# ============================================================================
+# MAP MANAGEMENT (Core map creation and manipulation functions)
+# ============================================================================
 
-def get_boundary_area(city_gdf) -> float:
-    """
-    Calculate boundary area, handling geographic vs projected CRS.
+class MapManager:
+    """Handles map creation and updates."""
     
-    Parameters:
-    city_gdf (GeoDataFrame): City boundary data
-    
-    Returns:
-    float: Total area in appropriate units
-    """
-    # Check if CRS is geographic (lat/lon)
-    if city_gdf.crs and city_gdf.crs.is_geographic:
-        # Reproject to projected CRS for accurate area calculation
-        city_gdf_projected = city_gdf.to_crs(epsg=3857)  # Web Mercator
-        return city_gdf_projected.geometry.area.sum()
-    else:
+    @staticmethod
+    def create_base_map(center: List[float], zoom: int = MAP_CONFIG["zoom_start"]) -> folium.Map:
+        """Create a base Folium map centered at the given coordinates."""
+        return folium.Map(
+            location=center,
+            zoom_start=zoom,
+            tiles=MAP_CONFIG["tiles"]
+        )
+
+    @staticmethod
+    def get_boundary_area(city_gdf: gpd.GeoDataFrame) -> float:
+        """Calculate boundary area, handling geographic vs projected CRS."""
+        if city_gdf.crs and city_gdf.crs.is_geographic:
+            # Reproject to projected CRS for accurate area calculation
+            city_gdf_projected = city_gdf.to_crs(epsg=3857)  # Web Mercator
+            return city_gdf_projected.geometry.area.sum()
         return city_gdf.geometry.area.sum()
 
+    @staticmethod
+    def format_area(area: float) -> str:
+        """Format area value with appropriate unit."""
+        if area >= 1e6:
+            return f"{area / 1e6:.2f} million sq units"
+        elif area >= 1e3:
+            return f"{area / 1e3:.2f}K sq units"
+        return f"{area:,.2f} sq units"
 
-def create_city_map(city_gdf) -> folium.Map:
-    """
-    Create a folium map with city boundary visualization.
+    @staticmethod
+    def add_city_boundary(m: folium.Map, city_gdf: gpd.GeoDataFrame) -> None:
+        """Add city boundary to the map."""
+        city_json = city_gdf.to_json()
+        folium.GeoJson(
+            city_json,
+            style_function=lambda x: GEOJSON_STYLE
+        ).add_to(m)
+
+    @staticmethod
+    def add_stores_to_map(m: folium.Map, stores_gdf: gpd.GeoDataFrame) -> None:
+        """Add store markers to the map with detailed information."""
+        if stores_gdf is None or stores_gdf.empty:
+            return
+            
+        for idx, row in stores_gdf.iterrows():
+            # Extract coordinates from point geometry
+            coords = row.geometry.coords[0]
+            
+            # Get store details
+            store_name = row.get('store_name', 'Unnamed Store')
+            shop_type = row.get('shop_type', 'Unknown')
+            
+            # Format distance if available
+            distance_text = ""
+            if 'distance' in row:
+                distance_meters = float(row['distance'])
+                if distance_meters < 1000:
+                    distance_text = f"<br>Distance: {distance_meters:.0f}m"
+                else:
+                    distance_text = f"<br>Distance: {distance_meters/1000:.1f}km"
+            
+            # Create detailed popup
+            popup_text = f"""
+                <div style='min-width: 200px'>
+                    <h4>{store_name}</h4>
+                    <b>Type:</b> {shop_type}
+                    {distance_text}
+                </div>
+            """
+            
+            # Add marker with custom icon based on shop type
+            icon_color = 'green'  # default
+            if shop_type == 'supermarket':
+                icon_color = 'red'
+            elif shop_type == 'convenience':
+                icon_color = 'orange'
+            elif shop_type == 'marketplace':
+                icon_color = 'blue'
+                
+            folium.Marker(
+                location=[coords[1], coords[0]],  # [lat, lon]
+                popup=folium.Popup(popup_text, max_width=300),
+                icon=folium.Icon(color=icon_color, icon='info-sign')
+            ).add_to(m)
+
+    @staticmethod
+    def display_map(
+        city_gdf: gpd.GeoDataFrame, 
+        stores_gdf: Optional[gpd.GeoDataFrame] = None,
+        center: Optional[List[float]] = None
+    ) -> folium.Map:
+        """Create and return a map with city boundary and optional store markers."""
+        if center is None:
+            # Project to Web Mercator for accurate centroid calculation
+            if city_gdf.crs and city_gdf.crs.is_geographic:
+                # Convert to projected CRS for accurate centroid
+                projected = city_gdf.to_crs(epsg=3857)
+                # Calculate centroid and convert back to original CRS
+                bounds = projected.geometry.total_bounds
+                center_x = (bounds[0] + bounds[2]) / 2
+                center_y = (bounds[1] + bounds[3]) / 2
+                centroid_point = gpd.points_from_xy([center_x], [center_y], crs=3857)
+                centroid_point = centroid_point.to_crs(city_gdf.crs)[0]
+            else:
+                # If already in projected CRS, calculate centroid directly
+                bounds = city_gdf.geometry.total_bounds
+                center_x = (bounds[0] + bounds[2]) / 2
+                center_y = (bounds[1] + bounds[3]) / 2
+                centroid_point = gpd.points_from_xy([center_x], [center_y], crs=city_gdf.crs)[0]
+                
+            # Extract coordinates from the centroid point
+            center = [centroid_point.coords[0][1], centroid_point.coords[0][0]]  # [lat, lon]
+        
+        # Create and populate map
+        m = MapManager.create_base_map(center)
+        MapManager.add_city_boundary(m, city_gdf)
+        
+        if stores_gdf is not None and not stores_gdf.empty:
+            MapManager.add_stores_to_map(m, stores_gdf)
+        
+        return m
+
+    @staticmethod
+    def display_metrics(city_gdf: gpd.GeoDataFrame) -> None:
+        """Display boundary metrics in columns."""
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Geometry Type", city_gdf.geometry.type.iloc[0])
+        
+        with col2:
+            st.metric("Total Polygons", len(city_gdf))
+        
+        with col3:
+            total_area = MapManager.get_boundary_area(city_gdf)
+            st.metric("Total Area", MapManager.format_area(total_area))
+
+# ============================================================================
+# USER INTERFACE (UI rendering and display functions)
+# ============================================================================
+
+class UserInterface:
+    """Handles UI elements and user interactions."""
     
-    Parameters:
-    city_gdf (GeoDataFrame): City boundary data
-    
-    Returns:
-    folium.Map: The created map object
-    """
-    # Calculate centroid for map centering (using modern union_all method)
-    centroid = city_gdf.geometry.union_all().centroid
-    
-    # Create base map
-    m = folium.Map(
-        location=[centroid.y, centroid.x],
-        zoom_start=MAP_CONFIG["zoom_start"],
-        tiles=MAP_CONFIG["tiles"]
-    )
-    
-    # Add GeoJSON layer with styling
-    folium.GeoJson(
-        city_gdf,
-        style_function=lambda x: GEOJSON_STYLE,
-        tooltip=folium.GeoJsonTooltip(
-            fields=['name'] if 'name' in city_gdf.columns else []
+    @staticmethod
+    def render_header():
+        """Configure page and render header."""
+        st.set_page_config(
+            page_title="Food Desert Mapper",
+            page_icon="🗺️",
+            layout="wide",
+            initial_sidebar_state="expanded"
         )
-    ).add_to(m)
-    
-    return m
+        st.title("🗺️ Food Desert Mapper")
+        st.markdown("""
+            This application helps you explore urban food deserts by visualizing city boundaries
+            and analyzing food availability across different neighborhoods.
+        """)
 
-
-def display_boundary_metrics(city_gdf) -> None:
-    """
-    Display boundary metrics in columns.
-    
-    Parameters:
-    city_gdf (GeoDataFrame): City boundary data
-    """
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Geometry Type", city_gdf.geometry.type.iloc[0])
-    
-    with col2:
-        st.metric("Total Polygons", len(city_gdf))
-    
-    with col3:
-        total_area = get_boundary_area(city_gdf)
-        st.metric("Total Area", format_area(total_area))
-
-
-def display_download_section(city_name: str) -> None:
-    """
-    Display GeoJSON download button.
-    
-    Parameters:
-    city_name (str): Name of the city
-    """
-    geojson_path = get_cached_geojson_path(city_name)
-    
-    if geojson_path.exists():
-        try:
-            with open(geojson_path, 'r') as f:
-                geojson_content = f.read()
+    @staticmethod
+    def render_sidebar() -> Tuple[str, Optional[str]]:
+        """Get user inputs from sidebar."""
+        with st.sidebar:
+            st.header("Search Parameters")
             
-            st.download_button(
-                label="📥 Download GeoJSON",
-                data=geojson_content,
-                file_name=geojson_path.name,
-                mime="application/geo+json",
-                key=f"download_{city_name}"
+            city = st.text_input(
+                "City Name:",
+                placeholder="e.g., New York City, London, Tokyo",
+                help="The name of the city you want to explore"
             )
-            logger.info(f"Download option provided for {city_name}")
+            
+            country = st.text_input(
+                "Country (optional):",
+                placeholder="e.g., USA, UK, Japan",
+                help="Helps disambiguate cities with the same name"
+            )
+            
+            # Add helpful tips
+            st.markdown("---")
+            st.markdown(
+                "<small>💡 **Tip:** Adding a country name helps find the correct city "
+                "if there are multiple matches.</small>",
+                unsafe_allow_html=True
+            )
+            
+            return city, country if country else None
+
+    @staticmethod
+    def display_city_selection(matches: List[Dict]) -> Optional[int]:
+        """
+        Display UI for selecting from multiple city matches.
+        
+        Args:
+            matches: List of city match dictionaries
+            
+        Returns:
+            Selected OSM ID or None
+        """
+        st.warning(f"⚠️ Found {len(matches)} possible matches. Please select the correct city:")
+        
+        options = []
+        for i, match in enumerate(matches):
+            display_name = match.get('display_name', 'Unknown')
+            osm_type = match.get('osm_type', 'unknown')
+            options.append(f"{i+1}. {display_name} (OSM Type: {osm_type})")
+        
+        selected = st.radio("Select a city:", options, key="city_selectior")
+        
+        if selected:
+            selected_idx = int(selected.split(".")[0]) - 1
+            selected_match = matches[selected_idx]
+
+            with st.expander("📍 Selected City Details"):
+                st.write(f"**Name:** {selected_match.get('name', 'Unknown')}")
+                st.write(f"**Full Name:** {selected_match.get('display_name', 'Unknown')}")
+                st.write(f"**Type:** {selected_match.get('osm_type', 'Unknown')}")
+                st.write(f"**OSM ID:** {selected_match.get('osm_id', 'Unknown')}")
+
+            if st.button("✅ Confirm Selection", type="primary"):
+                return selected_match.get('osm_id')
+        
+        return None
+
+    @staticmethod
+    def display_welcome():
+        """Display welcome message for new users."""
+        st.info(
+            "👋 **Welcome to the Food Desert Mapper!**\n\n"
+            "**How to use:**\n"
+            "1. Enter a city name in the sidebar\n"
+            "2. (Optional) Enter a country to disambiguate\n"
+            "3. Click 'Load City' to fetch and visualize the city boundary and grocery stores\n"
+            "4. Click 'Update Stores' to refresh store data from OpenStreetMap\n\n"
+            "All data will be saved to the database for future analysis."
+        )
+    
+    @staticmethod
+    def display_footer():
+        """Display page footer."""
+        st.markdown("---")
+        st.markdown(
+            "<div style='text-align: center; color: gray;'>"
+            "<small>Food Desert Mapper | Powered by OpenStreetMap & GeoPandas</small>"
+            "</div>",
+            unsafe_allow_html=True
+        )
+
+# ============================================================================
+# APPLICATION LOGIC (Core business logic and state management)
+# ============================================================================
+
+class AppLogic:
+    """Handles main application logic and state management."""
+    
+    @staticmethod
+    def update_stores(
+        city_name: str, 
+        country_name: Optional[str] = None
+    ) -> Tuple[int, int]:
+        """
+        Update store data for selected city.
+        
+        Args:
+            city_name: Name of the city to update stores for
+            country_name: Optional country name for disambiguation
+            
+        Returns:
+            Tuple containing:
+            - total_stores: Total number of stores in the city
+            - new_stores: Number of newly added stores
+            
+        Note: Existing stores will be updated if their data has changed.
+        """
+        logger.info(f"Updating stores for {city_name}")
+        try:
+            total_stores, new_stores = DataManager.update_city_stores(city_name, country_name)
+            
+            # Update session state
+            st.session_state.stores_updated = True
+            st.session_state.last_update_time = pd.Timestamp.now()
+            st.session_state.total_stores = total_stores
+            st.session_state.new_stores = new_stores
+
+            # Reload stores for display
+            stores_gdf = DataManager.get_all_city_stores(city_name, country_name)
+            st.session_state.stores_gdf = stores_gdf
+            
+            # Log results
+            if new_stores > 0:
+                logger.info(f"Added {new_stores} new stores")
+            else:
+                logger.info("No new stores added")
+                
+            return total_stores, new_stores
+            
         except Exception as e:
-            logger.error(f"Error preparing GeoJSON download: {e}")
-            st.warning("Could not prepare download file.")
-
-
-# ============================================================================
-# PAGE CONFIGURATION
-# ============================================================================
-
-st.set_page_config(
-    page_title="Food Desert Mapper",
-    page_icon="🗺️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS for better styling
-st.markdown("""
-    <style>
-    .main {
-        padding-top: 0rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-# ============================================================================
-# MAIN APPLICATION
-# ============================================================================
-
-# Header
-st.title("🗺️ Food Desert Mapper")
-st.markdown("""
-This application helps you explore urban food deserts by visualizing city boundaries
-and analyzing food availability across different neighborhoods.
-""")
-
-# Sidebar
-st.sidebar.header("📍 City Boundary Fetcher")
-st.sidebar.markdown("---")
-
-# Input fields
-city_name = st.sidebar.text_input(
-    "Enter City Name",
-    value="",
-    placeholder="e.g., New York City, London, Tokyo",
-    help="The name of the city you want to explore"
-)
-
-country_name = st.sidebar.text_input(
-    "Enter Country Name (Optional)",
-    value="",
-    placeholder="e.g., USA, UK, Japan",
-    help="Helps disambiguate cities with the same name"
-)
-
-# Load button
-load_button = st.sidebar.button(
-    "📥 Load City Boundary",
-    width='stretch',
-    key="load_city_btn"
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "<small>💡 **Tip:** Adding a country name helps find the correct city if there are multiple matches.</small>",
-    unsafe_allow_html=True
-)
-
-
-# ============================================================================
-# MAIN CONTENT LOGIC
-# ============================================================================
-
-if load_button:
-    # Input validation
-    if not city_name or not city_name.strip():
-        st.error("❌ Please enter a city name.")
-        logger.warning("User attempted to load boundary with empty city name")
-        st.stop()
+            logger.error(f"Failed to update stores: {e}")
+            st.session_state.stores_updated = False
+            raise
     
-    # Fetch and display data
-    with st.spinner(f"🔍 Fetching boundary for {city_name}..."):
+    @staticmethod
+    def process_city_selection(
+        city_name: str, 
+        country_name: Optional[str] = None,
+        osm_id: Optional[int] = None
+    ) -> Tuple[Optional[gpd.GeoDataFrame], Optional[List[Dict]]]:
+        """
+        Process city selection and return boundary data or matches.
+        
+        Returns:
+            Tuple of (GeoDataFrame or None, List of matches or None)
+        """
+        logger.info(f"Processing city: '{city_name}', country: '{country_name}', osm_id: {osm_id}")
+        
+        # Input validation and cleaning
+        if not isinstance(city_name, str):
+            raise ValueError("City name must be a non-empty string.")
+            
+        city_name = city_name.strip()
+        if not city_name:
+            raise ValueError("City name cannot be empty or whitespace only.")
+        
+        country_name = country_name.strip() if country_name and isinstance(country_name, str) else None
+        
         try:
-            logger.info(f"User requested city boundary: city='{city_name}', country='{country_name}'")
+            result = DataManager.load_city_boundary(city_name, country_name, osm_id)
             
-            # Fetch boundary data
-            city_gdf = load_boundary_data(
-                city_name,
-                country_name.strip() if country_name.strip() else None
-            )
+            # Check if we got multiple matches
+            if isinstance(result, tuple):
+                # Multiple matches found
+                _, matches = result
+                logger.info(f"Found {len(matches)} matches for '{city_name}'")
+                return None, matches
             
-            # Store in session state
+            # Single match found
+            city_gdf = result
+            
+            if city_gdf is None or city_gdf.empty:
+                raise RuntimeError(f"No boundary data found for '{city_name}'")
+
+            # Update session state
             st.session_state.city_gdf = city_gdf
             st.session_state.current_city = city_name
-            
-            logger.info(f"Successfully fetched boundary for {city_name}")
-            
-        except ValueError as val_error:
-            st.error(f"❌ Input Validation Error: {str(val_error)}")
-            logger.error(f"Validation error: {val_error}")
-            st.stop()
-            
+            st.session_state.current_country = country_name
+            st.session_state.available_matches = None
+
+            logger.info(f"Successfully processed city selection for {city_name}")
+            return city_gdf, None
+
         except Exception as e:
-            error_message = str(e)
-            st.error(f"❌ Error loading city boundary: {error_message}")
-            logger.error(f"Error fetching city boundary: {e}", exc_info=True)
-            
-            # Provide helpful suggestions
-            st.info(
-                "💡 **Troubleshooting Tips:**\n\n"
-                "- Verify the spelling of the city name\n"
-                "- Try adding the country name for disambiguation\n"
-                "- Check your internet connection\n"
-                "- OpenStreetMap may have limited data for very small cities"
-            )
-            st.stop()
+            logger.error(f"Failed to process city selection: {e}")
+            raise
 
-# Display results if data is in session state
-if st.session_state.city_gdf is not None:
-    city_gdf = st.session_state.city_gdf
-    current_city = st.session_state.current_city
+# ============================================================================
+# MAIN APPLICATION (Entry point and main execution flow)
+# ============================================================================
+
+def main():
+    """Main application function."""
+    # Initialize UI
+    UserInterface.render_header()
     
-    st.success(f"✅ Successfully loaded boundary for {current_city}")
-    
-    # Display metrics
-    st.markdown("---")
-    display_boundary_metrics(city_gdf)
-    st.markdown("---")
-    
-    # Display map
-    st.subheader("🗺️ City Boundary Map")
     try:
-        city_map = create_city_map(city_gdf)
-        st_folium(city_map, width=700, height=500)
-        logger.info(f"Map displayed successfully for {current_city}")
-    except Exception as map_error:
-        st.error(f"❌ Error displaying map: {str(map_error)}")
-        logger.error(f"Map display error: {map_error}", exc_info=True)
-    
-    # Display raw data
-    with st.expander("📊 View Raw Boundary Data"):
-        # Convert geometry to string for display to avoid Arrow serialization errors
-        display_gdf = city_gdf.copy()
-        display_gdf['geometry'] = display_gdf['geometry'].astype(str)
-        st.dataframe(display_gdf, width='stretch')
-        logger.info(f"User viewed raw data for {current_city}")
-    
-    # Download section
-    st.markdown("---")
-    st.subheader("📥 Download Data")
-    display_download_section(current_city)
+        # Get user inputs
+        city_name, country_name = UserInterface.render_sidebar()
 
-else:
-    # Welcome message
-    st.info(
-        "👋 **Welcome to the Food Desert Mapper!**\n\n"
-        "**How to use:**\n"
-        "1. Enter a city name in the sidebar\n"
-        "2. (Optional) Enter a country to disambiguate\n"
-        "3. Click 'Load City Boundary' to fetch and visualize\n\n"
-        "Boundary data will be saved and available for future analysis."
-    )
+        # Add action buttons
+        col1, col2 = st.sidebar.columns(2)
+        load_button = col1.button("🔍 Load City", use_container_width=True)
+        update_button = col2.button("🔄 Update Stores", use_container_width=True)
 
+        # Handel city loading
+        if load_button and city_name:
+            with st.spinner(f"🔍 Fetching boundary for {city_name}..."):
+                city_gdf, matches = AppLogic.process_city_selection(city_name, country_name)
 
-# ============================================================================
-# FOOTER
-# ============================================================================
+                if matches:
+                    # Store matches for selection
+                    st.session_state.available_matches = matches
+                    st.rerun()
+                    
+                elif city_gdf is not None:
+                    st.success(f"✅ Successfully loaded {city_name}!")
+                    st.rerun()
 
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: gray;'>"
-    "<small>Food Desert Mapper | Powered by OpenStreetMap & GeoPandas</small>"
-    "</div>",
-    unsafe_allow_html=True
-)
+        # Handle multiple matches selection
+        if st.session_state.available_matches:
+            selected_osm_id = UserInterface.display_city_selection(st.session_state.available_matches)
+            
+            if selected_osm_id:
+                with st.spinner("🔍 Loading selected city..."):
+                    city_gdf, _ = AppLogic.process_city_selection(
+                        city_name, 
+                        country_name, 
+                        osm_id=selected_osm_id
+                    )
+                    if city_gdf is not None:
+                        st.success(f"✅ Successfully loaded {city_name}!")
+                        st.session_state.available_matches = None
+                        st.rerun()
+
+        # Handle store updates
+        if update_button and st.session_state.city_gdf is not None:
+            with st.spinner("🔄 Updating store data..."):
+                total_stores, new_stores = AppLogic.update_stores(
+                    st.session_state.current_city,
+                    st.session_state.current_country
+                )
+                
+                if new_stores > 0:
+                    st.success(f"✅ Added {new_stores} new stores!")
+
+                else:
+                    st.info(f"ℹ️ Database is up to date ({total_stores} stores)")
+                st.rerun()
+
+        # Display content based on state
+        if st.session_state.city_gdf is not None and not st.session_state.available_matches:
+            st.markdown("---")
+            MapManager.display_metrics(st.session_state.city_gdf)
+            st.markdown("---")
+
+            st.subheader("🗺️ City Boundary & Grocery Stores")
+
+            # Display store count if available
+            if st.session_state.stores_gdf is not None and not st.session_state.stores_gdf.empty:
+                st.info(f"📊 Showing {len(st.session_state.stores_gdf)} grocery stores")
+
+            # Create and display map
+            m = MapManager.display_map(
+                st.session_state.city_gdf,
+                st.session_state.stores_gdf
+            )
+            st_folium(m, width=700, height=500, key="main_map")
+
+        elif not st.session_state.available_matches:
+            UserInterface.display_welcome()
+
+    except ValueError as val_error:
+        st.error(f"❌ Input Error: {str(val_error)}")
+        logger.error(f"Validation error: {val_error}")
+        
+    except Exception as e:
+        st.error(f"❌ An error occurred: {str(e)}")
+        logger.error(f"Application error: {e}", exc_info=True)
+        
+        # Show troubleshooting tips
+        with st.expander("🔧 Troubleshooting Tips"):
+            st.markdown("""
+            - Verify the spelling of the city name
+            - Try adding the country name for disambiguation
+            - Check your internet connection
+            - Ensure the database is properly configured
+            - Check logs for detailed error information
+            """)
+
+    UserInterface.display_footer()
+
+if __name__ == "__main__":
+    main()
