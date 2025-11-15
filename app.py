@@ -109,8 +109,27 @@ def calculate_bbox_from_bounds(bounds: Dict) -> Optional[Tuple[float, float, flo
         max_lat = north_east['lat']
         max_lon = north_east['lng']
         
-        return (min_lon, min_lat, max_lon, max_lat)
-    except (KeyError, TypeError) as e:
+        # Validate that all coordinates are valid numbers
+        if any(coord is None for coord in [min_lat, min_lon, max_lat, max_lon]):
+            logger.warning("Bounds contain None values")
+            return None
+        
+        # Validate coordinate ranges
+        if not (-90 <= min_lat <= 90 and -90 <= max_lat <= 90):
+            logger.warning(f"Invalid latitude values: {min_lat}, {max_lat}")
+            return None
+        
+        if not (-180 <= min_lon <= 180 and -180 <= max_lon <= 180):
+            logger.warning(f"Invalid longitude values: {min_lon}, {max_lon}")
+            return None
+        
+        # Ensure min < max
+        if min_lat >= max_lat or min_lon >= max_lon:
+            logger.warning(f"Invalid bbox: min >= max")
+            return None
+        
+        return (float(min_lon), float(min_lat), float(max_lon), float(max_lat))
+    except (KeyError, TypeError, ValueError) as e:
         logger.error(f"Error parsing bounds: {e}")
         return None
 
@@ -488,22 +507,41 @@ def main():
         
         # Update session state with new map position
         if map_data:
+            # Only update if we have valid bounds
             if map_data.get("bounds"):
-                st.session_state.current_bounds = map_data["bounds"]
+                new_bounds = map_data["bounds"]
                 
-                # Load stores for new bounds if they've changed significantly
-                new_stores = AppLogic.load_stores_for_bounds(map_data["bounds"])
+                # Validate the new bounds before using them
+                test_bbox = calculate_bbox_from_bounds(new_bounds)
                 
-                # Only rerun if we got new stores and stores are being shown
-                if show_stores and new_stores and len(new_stores) != len(stores):
-                    logger.info("Bounds changed, reloading stores")
-                    # Note: Automatic rerun might cause issues, so we'll let user navigate naturally
+                if test_bbox:
+                    # Only update if bounds actually changed significantly
+                    bounds_changed = False
+                    if st.session_state.current_bounds:
+                        old_bbox = calculate_bbox_from_bounds(st.session_state.current_bounds)
+                        if old_bbox:
+                            # Check if bounds changed by more than 0.001 degrees (~100m)
+                            bbox_diff = sum(abs(a - b) for a, b in zip(test_bbox, old_bbox))
+                            bounds_changed = bbox_diff > 0.004
+                    else:
+                        bounds_changed = True
+                    
+                    if bounds_changed:
+                        st.session_state.current_bounds = new_bounds
+                        logger.info(f"Bounds updated: {test_bbox}")
             
             if map_data.get("center"):
-                st.session_state.map_center = [
+                new_center = [
                     map_data["center"]["lat"],
                     map_data["center"]["lng"]
                 ]
+                # Only update if center changed significantly
+                if st.session_state.map_center:
+                    center_diff = sum(abs(a - b) for a, b in zip(new_center, st.session_state.map_center))
+                    if center_diff > 0.001:
+                        st.session_state.map_center = new_center
+                else:
+                    st.session_state.map_center = new_center
             
             if map_data.get("zoom"):
                 st.session_state.map_zoom = map_data["zoom"]

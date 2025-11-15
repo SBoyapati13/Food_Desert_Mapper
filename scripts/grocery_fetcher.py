@@ -135,8 +135,9 @@ class GroceryStoreFetcher:
                 stores['osm_id'] = stores.index
             
             # Fill missing values
-            stores['store_name'].fillna('Unnamed Store', inplace=True)
-            stores['shop_type'].fillna('unknown', inplace=True)
+            stores = stores.copy()
+            stores['store_name'] = stores['store_name'].fillna('Unnamed Store')
+            stores['shop_type'] = stores['shop_type'].fillna('unknown')
             
             # Build address from tags if available
             if 'addr:street' in stores.columns and 'addr:housenumber' in stores.columns:
