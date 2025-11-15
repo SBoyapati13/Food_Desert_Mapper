@@ -5,7 +5,7 @@ from psycopg2 import sql
 from psycopg2.extras import execute_batch
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from contextlib import contextmanager
-from typing import Generator, Any, Optional, Set, Dict
+from typing import Generator, Any, Optional, List, Tuple
 
 # Configure logging
 from .logger_config import setup_logging
@@ -78,10 +78,15 @@ def batch_insert(table: str, columns: list, values: list) -> None:
         columns (list): Column names
         values (list): List of value tuples to insert
     """
+    if not values:
+        return
+    
     query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(['%s'] * len(columns))})"
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             execute_batch(cur, query, values)
+
+    logger.info(f"Batch inserted {len(values)} rows into {table}")
 
 def create_database():
     """
@@ -121,6 +126,10 @@ def create_database():
 def create_tables():
     """
     Create necessary tables and extensions in the database.
+    
+    Schema:
+    - grocery_stores: Stores individual grocery store locations
+    - coverage_areas: Tracks which geographic areas have been fetched from OSM
     """
     try:
         with get_db_connection() as conn:
@@ -129,37 +138,49 @@ def create_tables():
                 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
                 logger.info("PostGIS extension enabled")
 
-                # Create table for city boundaries
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS city_boundaries (
-                        id SERIAL PRIMARY KEY,
-                        city_name VARCHAR(100) NOT NULL,
-                        country_name VARCHAR(100),
-                        boundary GEOMETRY(MULTIPOLYGON, 4326) NOT NULL,
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                        last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(city_name, country_name)
-                    );
-                """)
-
                 # Create table for grocery stores
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS grocery_stores (
                         id SERIAL PRIMARY KEY,
-                        store_name VARCHAR(100) NOT NULL,
+                        osm_id BIGINT UNIQUE,
+                        store_name VARCHAR(255) NOT NULL,
                         shop_type VARCHAR(50),
                         location GEOMETRY(POINT, 4326) NOT NULL,
-                        city_id INTEGER REFERENCES city_boundaries(id),
+                        address TEXT,
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                         last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                logger.info("Created grocery_stores table")
 
-                # Create spatial index on geometries
+                # Create table to track coverage areas (to avoid re-fetching)
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_city_boundary_geom ON city_boundaries USING GIST(boundary);
-                    CREATE INDEX IF NOT EXISTS idx_store_location_geom ON grocery_stores USING GIST(location);
+                    CREATE TABLE IF NOT EXISTS coverage_areas (
+                        id SERIAL PRIMARY KEY,
+                        bbox GEOMETRY(POLYGON, 4326) NOT NULL,
+                        fetched_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        store_count INTEGER DEFAULT 0
+                    );
                 """)
+                logger.info("Created coverage_areas table")
+
+                # Create spatial indices for fast querying
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_store_location_gist 
+                    ON grocery_stores USING GIST(location);
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_coverage_bbox_gist 
+                    ON coverage_areas USING GIST(bbox);
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_store_osm_id 
+                    ON grocery_stores(osm_id);
+                """)
+                
+                logger.info("Created spatial indices")
         
         logger.info("Database tables and indices created successfully")
         
@@ -179,7 +200,7 @@ def init_database():
         logger.error(f"Database initialization failed: {e}")
         raise
 
-def validate_database_environment(required_tables: Optional[Set[str]] = None) -> None:
+def validate_database_environment(required_tables: Optional[List[str]] = None) -> None:
     """
     Validates that the database environment is properly set up.
     
@@ -190,87 +211,141 @@ def validate_database_environment(required_tables: Optional[Set[str]] = None) ->
         RuntimeError: If database validation fails
     """
     try:
-        if required_tables:
-            # Check if required tables exist
-            tables_query = """
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_name = ANY(%s);
-            """
-            result = execute_query(tables_query, (list(required_tables),))
-            existing_tables = {row[0] for row in (result or [])}
-            missing_tables = required_tables - existing_tables
+        # Default required tables
+        if required_tables is None:
+            required_tables = ['grocery_stores', 'coverage_areas']
             
-            if missing_tables:
-                raise RuntimeError(f"Required tables {missing_tables} do not exist. Run db_setup.py first.")
+        # Check if required tables exist
+        tables_query = """
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public' 
+            AND table_name = ANY(%s);
+        """
+        result = execute_query(tables_query, (required_tables,))
+        existing_tables = {row[0] for row in (result or [])}
+        missing_tables = set(required_tables) - existing_tables
+        
+        if missing_tables:
+            raise RuntimeError(
+                f"Required tables {missing_tables} do not exist. "
+                f"Run 'python -m scripts.db_setup' to initialize the database."
+            )
         
         # Check if PostGIS extension is installed
         postgis_query = "SELECT postgis_version();"
         try:
             execute_query(postgis_query)
         except Exception:
-            raise RuntimeError("PostGIS extension is not installed. Run db_setup.py first.")
+            raise RuntimeError(
+                "PostGIS extension is not installed. "
+                "Run 'python -m scripts.db_setup' to initialize the database."
+            )
             
         logger.info("Database environment validation passed")
+
     except Exception as e:
         logger.error(f"Database validation failed: {e}")
         raise
 
-def get_entity_id(table: str, name_field: str, name: str, 
-                  extra_field: Optional[str] = None, 
-                  extra_value: Optional[str] = None) -> Optional[int]:
+def check_coverage(bbox: Tuple[float, float, float, float]) -> bool:
     """
-    Get entity ID from database based on name and optional extra field.
+    Check if a bounding box area has already been fetched.
     
     Args:
-        table: Table name to query
-        name_field: Name of the field containing the entity name
-        name: Value to search for
-        extra_field: Optional additional field for filtering
-        extra_value: Value for the extra field
+        bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
     
     Returns:
-        Optional[int]: Entity ID if found, None otherwise
+        bool: True if area is already covered, False otherwise
     """
     try:
-        query = f"""
-            SELECT id FROM {table} 
-            WHERE {name_field} = %s AND {extra_field + ' = %s' if extra_field else 'TRUE'}
-        """
-        params = (name, extra_value) if extra_value else (name,)
-        result = execute_query(query, params)
-        return result[0][0] if result else None
-    except Exception as e:
-        logger.error(f"Database error getting entity ID: {e}")
-        raise
-
-def check_entity_exists(table: str, criteria: Dict[str, Any]) -> bool:
-    """
-    Check if an entity exists in the database based on multiple criteria.
-    
-    Args:
-        table: Table name to query
-        criteria: Dictionary of field names and values to check
-    
-    Returns:
-        bool: True if entity exists, False otherwise
-    """
-    try:
-        conditions = " AND ".join(f"{k} = %s" for k in criteria.keys())
-        query = f"""
+        min_lon, min_lat, max_lon, max_lat = bbox
+        
+        # Create polygon from bbox
+        bbox_wkt = f"POLYGON(({min_lon} {min_lat}, {max_lon} {min_lat}, {max_lon} {max_lat}, {min_lon} {max_lat}, {min_lon} {min_lat}))"
+        
+        # Check if this bbox is covered by existing coverage areas
+        query = """
             SELECT EXISTS (
-                SELECT 1 FROM {table}
-                WHERE {conditions}
+                SELECT 1 FROM coverage_areas
+                WHERE ST_Contains(bbox, ST_GeomFromText(%s, 4326))
             );
         """
-        result = execute_query(query, tuple(criteria.values()))
+        
+        result = execute_query(query, (bbox_wkt,))
         return bool(result and result[0][0])
+        
     except Exception as e:
-        logger.error(f"Database error checking entity existence: {e}")
+        logger.error(f"Error checking coverage: {e}")
+        return False
+    
+def add_coverage(bbox: Tuple[float, float, float, float], store_count: int) -> None:
+    """
+    Record that a bounding box area has been fetched.
+    
+    Args:
+        bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
+        store_count: Number of stores found in this area
+    """
+    try:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        
+        # Create polygon from bbox
+        bbox_wkt = f"POLYGON(({min_lon} {min_lat}, {max_lon} {min_lat}, {max_lon} {max_lat}, {min_lon} {max_lat}, {min_lon} {min_lat}))"
+        
+        query = """
+            INSERT INTO coverage_areas (bbox, store_count)
+            VALUES (ST_GeomFromText(%s, 4326), %s);
+        """
+        
+        execute_query(query, (bbox_wkt, store_count))
+        logger.info(f"Added coverage for bbox with {store_count} stores")
+        
+    except Exception as e:
+        logger.error(f"Error adding coverage: {e}")
         raise
+
+def get_stores_in_bbox(bbox: Tuple[float, float, float, float]) -> List[Tuple]:
+    """
+    Get all stores within a bounding box.
+    
+    Args:
+        bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
+    
+    Returns:
+        List of tuples containing store data
+    """
+    try:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        
+        query = """
+            SELECT 
+                id,
+                osm_id,
+                store_name, 
+                shop_type, 
+                ST_X(location) as longitude,
+                ST_Y(location) as latitude,
+                address
+            FROM grocery_stores
+            WHERE location && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
+            AND ST_Within(location, ST_MakeEnvelope(%s, %s, %s, %s, 4326));
+        """
+        
+        params = (min_lon, min_lat, max_lon, max_lat, min_lon, min_lat, max_lon, max_lat)
+        result = execute_query(query, params)
+        
+        return result or []
+        
+    except Exception as e:
+        logger.error(f"Error getting stores in bbox: {e}")
+        return []
 
 if __name__ == "__main__":
     try:
         init_database()
+        print("✓ Database initialized successfully!")
+        print("✓ Ready to use the map-based food desert mapper")
     except Exception as e:
         logger.error(f"Setup failed: {e}")
+        print(f"✗ Database setup failed: {e}")

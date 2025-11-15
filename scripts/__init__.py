@@ -3,11 +3,14 @@ from .db_setup import (
     batch_insert,
     init_database,
     validate_database_environment,
-    get_entity_id,
-    check_entity_exists
+    check_coverage,
+    add_coverage,
+    get_stores_in_bbox
 )
-from .city_fetcher import fetch_city_boundary
-from .grocery_fetcher import GroceryStoreFetcher
+from .grocery_fetcher import (
+    fetch_stores_in_bbox,
+    GroceryStoreFetcher
+)
 from .utils import (
     ensure_data_directory,
     load_environment,
@@ -20,11 +23,12 @@ __all__ = [
     'batch_insert',
     'init_database',
     'validate_database_environment',
-    'get_entity_id',
-    'check_entity_exists',
+    'check_coverage',
+    'add_coverage',
+    'get_stores_in_bbox',
     
-    # City operations
-    'fetch_city_boundary',
+    # Grocery operations
+    'fetch_stores_in_bbox',
     'GroceryStoreFetcher',
     
     # Utilities

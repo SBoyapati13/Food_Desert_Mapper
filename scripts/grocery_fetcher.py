@@ -3,17 +3,18 @@ import geopandas as gpd
 import pandas as pd
 import logging
 from typing import Dict, Union, List, Optional, Tuple
+from shapely.geometry import Point, box
 
 from .db_setup import (
     execute_query,
     batch_insert,
     validate_database_environment,
-    get_entity_id,
-    check_entity_exists
+    check_coverage,
+    add_coverage,
+    get_stores_in_bbox
 )
 from .utils import (
-    ensure_data_directory,
-    validate_string_input
+    ensure_data_directory
 )
 
 # Configure logging
@@ -32,365 +33,313 @@ STORE_TAGS: Dict[str, Union[str, List[str], bool]] = {
 }
 
 class GroceryStoreFetcher:
-    def _get_city_id(self, city_name: str, country_name: Optional[str] = None) -> Optional[int]:
-        """
-        Get city ID from database.
-        
-        Args:
-            city_name: Name of the city
-            country_name: Optional name of the country
-            
-        Returns:
-            Optional[int]: City ID if found, None otherwise
-            
-        Raises:
-            ValueError: If city_name is invalid
-        """
-        validate_string_input(city_name, "city_name")
-        validate_string_input(country_name, "country_name", allow_none=True)
-        
-        return get_entity_id(
-            table='city_boundaries',
-            name_field='city_name',
-            name=city_name,
-            extra_field='country_name' if country_name else None,
-            extra_value=country_name
-        )
+    """
+    Handles fetching and storing grocery store data based on geographic bounding boxes.
+    """
+    def __init__(self) -> None:
+        """Initialize the grocery store fetcher."""
+        validate_database_environment(['grocery_stores', 'coverage_areas'])
 
-    def _get_store_id(self, store_name: str, location: str, city_id: int) -> Optional[int]:
+    def _store_exists(self, osm_id: int) -> bool:
         """
-        Get store ID if it exists in database.
+        Check if a store already exists in the database by OSM ID.
         
         Args:
-            store_name: Name of the store
-            location: WKT representation of store location
-            city_id: ID of the city where the store is located
-            
-        Returns:
-            Optional[int]: Store ID if exists, None otherwise
-        """
-        validate_string_input(store_name, "store_name")
-        validate_string_input(location, "location")
-
-        if not isinstance(city_id, int) or city_id <= 0:
-            raise ValueError("city_id must be a positive integer")
-            
-        query = """
-            SELECT id FROM grocery_stores 
-            WHERE store_name = %s 
-            AND ST_Equals(location, ST_GeomFromText(%s, 4326))
-            AND city_id = %s
-        """
-        result = execute_query(query, (store_name, location, city_id))
-        return result[0][0] if result else None
-        
-    def _store_needs_update(self, store_id: int, store_name: str, shop_type: str, location: str) -> bool:
-        """
-        Check if store data needs to be updated.
-        
-        Args:
-            store_id: ID of the store
-            store_name: Current store name
-            shop_type: Current shop type
-            location: Current WKT location
-            
-        Returns:
-            bool: True if store needs update, False otherwise
-        """
-        query = """
-            SELECT store_name, shop_type, ST_AsText(location) as location
-            FROM grocery_stores 
-            WHERE id = %s
-        """
-        result = execute_query(query, (store_id,))
-        if not result:
-            return False
-            
-        db_name, db_type, db_location = result[0]
-        return (
-            db_name != store_name or
-            db_type != shop_type or
-            not db_location == location  # Compare WKT strings
-        )
-        
-    def _update_store(self, store_id: int, store_name: str, shop_type: str, location: str) -> None:
-        """
-        Update store data in database.
-        
-        Args:
-            store_id: ID of the store to update
-            store_name: New store name
-            shop_type: New shop type
-            location: New WKT location
-        """
-        query = """
-            UPDATE grocery_stores 
-            SET store_name = %s,
-                shop_type = %s,
-                location = ST_GeomFromText(%s, 4326),
-                last_updated = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """
-        execute_query(query, (store_name, shop_type, location, store_id))
-        logger.info(f"Updated store {store_id} ({store_name})")
-        
-    def _touch_store(self, store_id: int) -> None:
-        """
-        Update last_updated timestamp for a store.
-        
-        Args:
-            store_id: ID of the store to update
-        """
-        query = """
-            UPDATE grocery_stores 
-            SET last_updated = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """
-        execute_query(query, (store_id,))
-        
-    def _store_exists(self, store_name: str, location: str, city_id: int) -> bool:
-        """
-        Check if store already exists in database.
-        
-        Args:
-            store_name: Name of the store
-            location: WKT representation of store location
-            city_id: ID of the city where the store is located
+            osm_id: OpenStreetMap ID of the store
             
         Returns:
             bool: True if store exists, False otherwise
-            
-        Raises:
-            ValueError: If store_name or location is invalid
         """
-        return self._get_store_id(store_name, location, city_id) is not None
-
-    def fetch_and_save_stores(self, city_gdf: gpd.GeoDataFrame, 
-                            city_name: str, 
-                            country_name: Optional[str] = None) -> gpd.GeoDataFrame:
+        query = "SELECT EXISTS(SELECT 1 FROM grocery_stores WHERE osm_id = %s);"
+        result = execute_query(query, (osm_id,))
+        return bool(result and result[0][0])
+    
+    def _upsert_store(
+        self, 
+        osm_id: int,
+        store_name: str, 
+        shop_type: str, 
+        longitude: float,
+        latitude: float,
+        address: Optional[str] = None
+    ) -> None:
         """
-        Fetch grocery stores within a city boundary and save to database.
+        Insert or update a store in the database.
         
         Args:
-            city_gdf (GeoDataFrame): City boundary as a GeoDataFrame.
-            city_name (str): Name of the city.
-            country_name (Optional[str]): Name of the country.
-        
-        Returns:
-            GeoDataFrame: Grocery stores data.
-            
-        Raises:
-            RuntimeError: If database environment is not properly set up
-            ValueError: If city is not found in database
+            osm_id: OpenStreetMap ID
+            store_name: Name of the store
+            shop_type: Type of shop (supermarket, convenience, etc.)
+            longitude: Longitude coordinate
+            latitude: Latitude coordinate
+            address: Optional address string
         """
+        query = """
+            INSERT INTO grocery_stores (osm_id, store_name, shop_type, location, address)
+            VALUES (%s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s)
+            ON CONFLICT (osm_id) DO UPDATE
+            SET store_name = EXCLUDED.store_name,
+                shop_type = EXCLUDED.shop_type,
+                location = EXCLUDED.location,
+                address = EXCLUDED.address,
+                last_updated = CURRENT_TIMESTAMP;
+        """
+        
+        execute_query(query, (osm_id, store_name, shop_type, longitude, latitude, address))
+
+    def fetch_from_osm(self, bbox: Tuple[float, float, float, float]) -> gpd.GeoDataFrame:
+        """
+        Fetch grocery stores from OpenStreetMap for a given bounding box.
+        
+        Args:
+            bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
+            
+        Returns:
+            GeoDataFrame containing the fetched stores
+        """
+        min_lon, min_lat, max_lon, max_lat = bbox
+        logger.info(f"Fetching stores from OSM for bbox: {bbox}")
+        
         try:
-            # Validate database environment
-            validate_database_environment({'city_boundaries', 'grocery_stores'})
+            # Create bbox polygon
+            bbox_polygon = box(min_lon, min_lat, max_lon, max_lat)
             
-            # Get city ID
-            city_id = self._get_city_id(city_name, country_name)
-            if not city_id:
-                raise ValueError(f"City {city_name} not found in database")
+            # Fetch features from OSM
+            stores_gdf = ox.features_from_polygon(bbox_polygon, STORE_TAGS)
             
-            # Fetch stores from OSM
-            logger.info(f"Fetching stores for {city_name}...")
-            city_polygon = city_gdf.iloc[0].geometry
-            stores_gdf = ox.features_from_polygon(city_polygon, STORE_TAGS)
+            if stores_gdf.empty:
+                logger.info("No stores found in this area")
+                return gpd.GeoDataFrame()
             
-            # Filter and clean data
+            # Filter for points only
             stores = stores_gdf[stores_gdf.geometry.type == 'Point'].copy()
-            required_cols = ['geometry', 'name', 'shop']
-            stores = stores.reindex(columns=required_cols).fillna({'name': 'Unnamed Store'})
-            stores = stores.reset_index(drop=True)
             
-            # Prepare data for database
-            new_stores = []
-            updated_stores = []
+            if stores.empty:
+                logger.info("No point-type stores found in this area")
+                return gpd.GeoDataFrame()
             
-            for _, row in stores.iterrows():
-                store_name = row.get('name', 'Unnamed Store')
-                shop_type = row.get('shop', 'unknown')
-                wkt = row.geometry.wkt
-                
-                # Check if store exists and needs update
-                store_id = self._get_store_id(store_name, wkt, city_id)
-                
-                if store_id is None:
-                    # New store
-                    new_stores.append((
-                        store_name,
-                        shop_type,
-                        wkt,
-                        city_id
-                    ))
-                else:
-                    # Existing store - check if needs update
-                    if self._store_needs_update(store_id, store_name, shop_type, wkt):
-                        self._update_store(store_id, store_name, shop_type, wkt)
-                        updated_stores.append(store_id)
-                    else:
-                        # Just update last_updated timestamp
-                        self._touch_store(store_id)
+            # Extract relevant columns
+            stores['store_name'] = stores.get('name', 'Unnamed Store')
+            stores['shop_type'] = stores.get('shop', 'unknown')
             
-            # Batch insert new stores
-            if new_stores:
-                batch_insert('grocery_stores',
-                           ['store_name', 'shop_type', 'location', 'city_id'],
-                           new_stores)
-                logger.info(f"Added {len(new_stores)} new stores to database")
-                
-            if updated_stores:
-                logger.info(f"Updated {len(updated_stores)} existing stores")
+            # Get OSM ID from index or osmid column
+            if 'osmid' in stores.columns:
+                stores['osm_id'] = stores['osmid']
+            elif hasattr(stores.index, 'get_level_values'):
+                # Multi-index case
+                try:
+                    stores['osm_id'] = stores.index.get_level_values('osmid')
+                except KeyError:
+                    stores['osm_id'] = range(len(stores))  # Fallback
+            else:
+                stores['osm_id'] = stores.index
             
-            total_processed = len(new_stores) + len(updated_stores)
-            logger.info(f"Total stores processed: {total_processed}")
+            # Fill missing values
+            stores['store_name'].fillna('Unnamed Store', inplace=True)
+            stores['shop_type'].fillna('unknown', inplace=True)
             
+            # Build address from tags if available
+            if 'addr:street' in stores.columns and 'addr:housenumber' in stores.columns:
+                stores['address'] = (
+                    stores['addr:housenumber'].fillna('').astype(str) + ' ' + 
+                    stores['addr:street'].fillna('').astype(str)
+                ).str.strip()
+            else:
+                stores['address'] = None
+            
+            logger.info(f"Found {len(stores)} stores in OSM")
             return stores
             
         except Exception as e:
-            logger.error(f"Error fetching/saving stores: {e}")
-            raise
-    
-    def get_stores_in_radius(self, lat: float, lon: float, radius_meters: float = 1000) -> gpd.GeoDataFrame:
+            logger.error(f"Error fetching from OSM: {e}")
+            return gpd.GeoDataFrame()
+        
+    def save_stores(self, stores_gdf: gpd.GeoDataFrame) -> int:
         """
-        Get all stores within a radius of a point.
+        Save stores to the database.
         
         Args:
-            lat: Latitude of center point (-90 to 90)
-            lon: Longitude of center point (-180 to 180)
-            radius_meters: Search radius in meters (positive number)
-        
+            stores_gdf: GeoDataFrame containing stores to save
+            
         Returns:
-            GeoDataFrame: Stores within radius
-            
-        Raises:
-            ValueError: If input parameters are invalid
+            int: Number of stores saved/updated
         """
-        # Validate coordinates
-        if not -90 <= lat <= 90:
-            raise ValueError("Latitude must be between -90 and 90 degrees")
-        if not -180 <= lon <= 180:
-            raise ValueError("Longitude must be between -180 and 180 degrees")
-        if radius_meters <= 0:
-            raise ValueError("Radius must be a positive number")
+        if stores_gdf.empty:
+            return 0
         
-        try:
-            query = """
-                SELECT store_name, shop_type, ST_AsText(location) as geometry,
-                       ST_Distance(
-                           location::geography,
-                           ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
-                       ) as distance
-                FROM grocery_stores
-                WHERE ST_DWithin(
-                    location::geography,
-                    ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
-                    %s
-                )
-                ORDER BY distance;
-            """
+        saved_count = 0
+        updated_count = 0
+        
+        for idx, row in stores_gdf.iterrows():
+            try:
+                osm_id = int(row['osm_id'])
+                store_name = str(row['store_name'])
+                shop_type = str(row['shop_type'])
+                
+                # Get coordinates
+                geom = row.geometry
+                longitude = geom.x
+                latitude = geom.y
+                
+                address = row.get('address')
+                
+                # Check if exists
+                exists = self._store_exists(osm_id)
+                
+                # Upsert the store
+                self._upsert_store(osm_id, store_name, shop_type, longitude, latitude, address)
+                
+                if exists:
+                    updated_count += 1
+                else:
+                    saved_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error saving store {idx}: {e}")
+                continue
+        
+        total = saved_count + updated_count
+        logger.info(f"Saved/updated {total} stores ({saved_count} new, {updated_count} updated)")
+        return total
+    
+    def fetch_and_save(self, bbox: Tuple[float, float, float, float]) -> int:
+        """
+        Fetch stores from OSM for a bounding box and save to database.
+        
+        Args:
+            bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
             
-            rows = execute_query(query, (lon, lat, lon, lat, radius_meters))
-            
-            if not rows:
-                return gpd.GeoDataFrame()
-            
-            # Convert to GeoDataFrame
-            df = pd.DataFrame(rows, columns=['store_name', 'shop_type', 'geometry', 'distance'])
-            gdf = gpd.GeoDataFrame(
-                df,
-                geometry=gpd.GeoSeries.from_wkt(df['geometry']),
-                crs="EPSG:4326"
-            )
-            return gdf
-            
-        except Exception as e:
-            logger.error(f"Database error fetching stores in radius: {e}")
-            raise
-
-def update_stores_for_city(city_name: str, country_name: Optional[str] = None) -> Tuple[int, int]:
+        Returns:
+            int: Number of stores saved
+        """
+        # Check if area already covered
+        if check_coverage(bbox):
+            logger.info("Area already covered, skipping fetch")
+            return 0
+        
+        # Fetch from OSM
+        stores_gdf = self.fetch_from_osm(bbox)
+        
+        # Save to database
+        store_count = self.save_stores(stores_gdf)
+        
+        # Record coverage
+        add_coverage(bbox, store_count)
+        
+        return store_count
+    
+def fetch_stores_in_bbox(bbox: Tuple[float, float, float, float]) -> List[Dict]:
     """
-    Update grocery store data for a specific city.
+    Get all stores in a bounding box, fetching from OSM if not in database.
     
     Args:
-        city_name: Name of the city to update stores for
-        country_name: Optional name of the country for disambiguation
-    
+        bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
+        
     Returns:
-        Tuple[int, int]: (total_stores, new_stores)
-        total_stores: Total number of stores in the city
-        new_stores: Number of newly added stores
-        
-    Raises:
-        ValueError: If city_name is invalid
-        RuntimeError: If database environment is not properly set up
+        List of dictionaries containing store data
     """
-    validate_string_input(city_name, "city_name")
-    validate_string_input(country_name, "country_name", allow_none=True)
-    
-    from .city_fetcher import fetch_city_boundary
-    
     try:
-        result = fetch_city_boundary(city_name, country_name)
-
-        if isinstance(result, tuple):
-            _, matches = result
-            raise ValueError(
-                f"Multiple matches found for '{city_name}'. "
-                f"Please use the UI to select the correct city first, or provide a country name. "
-                f"Found {len(matches)} matches."
-            )
-        
-        # Single match - it's a GeoDataFrame
-        city_gdf = result
-        if city_gdf is None or city_gdf.empty:
-            raise ValueError(f"No boundary data found for '{city_name}'")
-        
-        # Get existing store count
-        city_id = get_entity_id(
-            'city_boundaries',
-            'city_name',
-            city_name,
-            'country_name' if country_name else None,
-            country_name
-        )
-        
-        if city_id:
-            existing_count = execute_query(
-                "SELECT COUNT(*) FROM grocery_stores WHERE city_id = %s",
-                (city_id,)
-            )[0][0]
-        else:
-            existing_count = 0
-            
-        # Fetch and save stores
+        # First, check if we need to fetch from OSM
         fetcher = GroceryStoreFetcher()
-        fetcher.fetch_and_save_stores(
-            city_gdf,
-            city_name,
-            country_name
-        )
+        fetcher.fetch_and_save(bbox)
         
-        # Get new total count
-        new_total = execute_query(
-            "SELECT COUNT(*) FROM grocery_stores WHERE city_id = %s",
-            (city_id,)
-        )[0][0]
+        # Now get stores from database
+        stores_data = get_stores_in_bbox(bbox)
         
-        # Calculate new stores (difference in total)
-        new_stores = new_total - existing_count
-            
-        return new_total, max(0, new_stores)  # Ensure non-negative new store count
+        # Convert to list of dicts
+        stores = []
+        for row in stores_data:
+            stores.append({
+                'id': row[0],
+                'osm_id': row[1],
+                'name': row[2],
+                'shop_type': row[3],
+                'longitude': row[4],
+                'latitude': row[5],
+                'address': row[6]
+            })
+        
+        logger.info(f"Returning {len(stores)} stores for bbox")
+        return stores
         
     except Exception as e:
-        logger.error(f"Error updating stores for {city_name}: {e}")
-        raise
+        logger.error(f"Error in fetch_stores_in_bbox: {e}")
+        return []
 
+def get_stores_at_point(
+    latitude: float, 
+    longitude: float, 
+    radius_km: float = 1.0
+) -> List[Dict]:
+    """
+    Get stores within a radius of a point.
+    
+    Args:
+        latitude: Latitude of center point
+        longitude: Longitude of center point
+        radius_km: Radius in kilometers
+        
+    Returns:
+        List of dictionaries containing store data with distances
+    """
+    try:
+        query = """
+            SELECT 
+                id,
+                osm_id,
+                store_name,
+                shop_type,
+                ST_X(location) as longitude,
+                ST_Y(location) as latitude,
+                address,
+                ST_Distance(
+                    location::geography,
+                    ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
+                ) / 1000.0 as distance_km
+            FROM grocery_stores
+            WHERE ST_DWithin(
+                location::geography,
+                ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+                %s
+            )
+            ORDER BY distance_km;
+        """
+        
+        radius_meters = radius_km * 1000
+        params = (longitude, latitude, longitude, latitude, radius_meters)
+        
+        result = execute_query(query, params)
+        
+        stores = []
+        for row in result or []:
+            stores.append({
+                'id': row[0],
+                'osm_id': row[1],
+                'name': row[2],
+                'shop_type': row[3],
+                'longitude': row[4],
+                'latitude': row[5],
+                'address': row[6],
+                'distance_km': float(row[7])
+            })
+        
+        return stores
+        
+    except Exception as e:
+        logger.error(f"Error getting stores at point: {e}")
+        return []
+    
 if __name__ == "__main__":
     # Example usage
     try:
-        total, new = update_stores_for_city("New Brunswick", "USA")
-        logger.info(f"Updated stores: {total} total, {new} new")
+        # Example: Fetch stores in New Brunswick, NJ area
+        bbox = (-74.47, 40.48, -74.42, 40.52)  # (min_lon, min_lat, max_lon, max_lat)
+        
+        stores = fetch_stores_in_bbox(bbox)
+        print(f"Found {len(stores)} stores in the area")
+        
+        for store in stores[:5]:  # Print first 5
+            print(f"- {store['name']} ({store['shop_type']}) at {store['latitude']}, {store['longitude']}")
+            
     except Exception as e:
-        logger.error(f"Failed to update stores: {e}")
-        raise
+        logger.error(f"Example failed: {e}")

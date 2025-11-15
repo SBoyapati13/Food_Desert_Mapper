@@ -1,15 +1,14 @@
 import streamlit as st
 import folium
+from folium.plugins import MarkerCluster
 import logging
-import geopandas as gpd
-import pandas as pd
-from pathlib import Path
-from typing import Optional, Tuple, List, Union, Dict
+from typing import Optional, Tuple, List, Dict
 from streamlit_folium import st_folium
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
 # Import from our package
-from scripts.city_fetcher import fetch_city_boundary
-from scripts.grocery_fetcher import GroceryStoreFetcher, update_stores_for_city
+from scripts.grocery_fetcher import fetch_stores_in_bbox, get_stores_at_point
 from scripts.logger_config import setup_logging
 
 # Configure logging
@@ -20,263 +19,229 @@ logger = logging.getLogger(__name__)
 # CONSTANTS AND CONFIGURATION
 # ============================================================================
 
+# Default map center (you can change this to your preferred location)
+DEFAULT_CENTER = [40.4862, -74.4518]  # New Brunswick, NJ
+DEFAULT_ZOOM = 13
+
 MAP_CONFIG = {
-    "zoom_start": 11,
-    "tiles": "OpenStreetMap"
+    "zoom_start": DEFAULT_ZOOM,
+    "tiles": "OpenStreetMap",
+    "width": "100%",
+    "height": 600
 }
 
-GEOJSON_STYLE = {
-    'fillColor': '#3388ff',
-    'color': '#003d99',
-    'fillOpacity': 0.2,
-    'weight': 2
+# Store marker colors by shop type
+STORE_COLORS = {
+    'supermarket': 'red',
+    'grocery': 'green',
+    'convenience': 'orange',
+    'greengrocer': 'lightgreen',
+    'marketplace': 'blue',
+    'unknown': 'gray'
 }
 
-# Initialize session state with default values
+# Initialize session state
 DEFAULT_SESSION_STATE = {
-    "city_gdf": None,
-    "current_city": None,
-    "current_country": None,
-    "stores_gdf": None,
-    "stores_updated": False,
-    "last_update_time": None,
-    "total_stores": 0,
-    "new_stores": 0,
-    "available_matches": None,  # NEW: Store multiple city matches
-    "selected_osm_id": None,    # NEW: Store selected OSM ID
-    "pending_city_name": None,      # Store the city name being processed
-    "pending_country_name": None   # Store the country name being processed
+    "map_center": DEFAULT_CENTER,
+    "map_zoom": DEFAULT_ZOOM,
+    "show_stores": True,
+    "current_bounds": None,
+    "stores_cache": {},
+    "search_address": "",
 }
 
 for key, value in DEFAULT_SESSION_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
+
 # ============================================================================
-# DATA MANAGEMENT (Base utilities for data fetching and caching)
+# UTILITY FUNCTIONS
 # ============================================================================
 
-class DataManager:
-    """Handles data caching and retrieval for the application."""
+def geocode_address(address: str) -> Optional[Tuple[float, float]]:
+    """
+    Geocode an address to coordinates.
     
-    @staticmethod
-    @st.cache_data(ttl=300)  # Cache for 5 minutes
-    def load_city_boundary(
-        city_name: str, 
-        country_name: Optional[str] = None,
-        osm_id: Optional[int] = None
-    ) -> Union[gpd.GeoDataFrame, Tuple[None, List[Dict]]]:
-        """
-        Load city boundary data.
+    Args:
+        address: Address string to geocode
         
-        Returns:
-            Either a GeoDataFrame (single match) or Tuple[None, List[Dict]] (multiple matches)
-        """
-        return fetch_city_boundary(city_name, country_name, osm_id)
+    Returns:
+        Tuple of (latitude, longitude) or None if not found
+    """
+    if not address or not address.strip():
+        return None
     
-    @staticmethod
-    @st.cache_data(ttl=300)
-    def get_all_city_stores(city_name: str, country_name: Optional[str] = None) -> gpd.GeoDataFrame:
-        """Get all stores for a given city."""
-        try:
-            fetcher = GroceryStoreFetcher()
-            city_id = fetcher._get_city_id(city_name, country_name)
-
-            if not city_id:
-                logger.warning(f"City {city_name} not found in database.")
-                return gpd.GeoDataFrame()
-            
-            from scripts.db_setup import execute_query
-            query = """
-                SELECT store_name, shop_type, ST_AsText(location) as geometry
-                FROM grocery_stores
-                WHERE city_id = %s
-            """
-            rows = execute_query(query, (city_id,))
-
-            if not rows:
-                return gpd.GeoDataFrame()
-            
-            df = pd.DataFrame(rows, columns=['store_name', 'shop_type', 'geometry'])
-            gdf = gpd.GeoDataFrame(
-                df,
-                geometry=gpd.GeoSeries.from_wkt(df['geometry']),
-                crs="EPSG:4326"
-            )
-
-            return gdf
+    try:
+        geolocator = Nominatim(user_agent="food-desert-mapper")
+        location = geolocator.geocode(address, timeout=10)
         
-        except Exception as e:
-            logger.error(f"Error getting city stores: {e}")
-            return gpd.GeoDataFrame()
+        if location and hasattr(location, 'latitude') and hasattr(location, 'longitude'):
+            logger.info(f"Geocoded '{address}' to {location.latitude}, {location.longitude}")
+            return (float(location.latitude), float(location.longitude))
+        else:
+            logger.warning(f"Could not geocode address: {address}")
+            return None
+            
+    except (GeocoderTimedOut, GeocoderServiceError) as e:
+        logger.error(f"Geocoding error: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected geocoding error: {e}")
+        return None
 
-    @staticmethod
-    @st.cache_data(ttl=300, show_spinner=False)
-    def update_city_stores(city_name: str, country_name: Optional[str] = None) -> Tuple[int, int]:
-        """
-        Update store data for a city.
+def calculate_bbox_from_bounds(bounds: Dict) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Calculate bounding box from Folium map bounds.
+    
+    Args:
+        bounds: Dictionary with '_southWest' and '_northEast' keys
         
-        Args:
-            city_name: Name of the city to update stores for
-            country_name: Optional country name for disambiguation
-            
-        Returns:
-            Tuple containing:
-            - total_stores: Total number of stores in the city
-            - new_stores: Number of newly added stores
-            
-        Note:
-            This method is cached for 5 minutes (300 seconds) to prevent
-            too frequent updates to the database. Existing stores will
-            be updated if their data has changed.
-        """
-        logger.info(f"Updating stores for {city_name} (cached for 5 minutes)")
-        return update_stores_for_city(city_name, country_name)
+    Returns:
+        Tuple of (min_lon, min_lat, max_lon, max_lat)
+    """
+    try:
+        south_west = bounds['_southWest']
+        north_east = bounds['_northEast']
+        
+        min_lat = south_west['lat']
+        min_lon = south_west['lng']
+        max_lat = north_east['lat']
+        max_lon = north_east['lng']
+        
+        return (min_lon, min_lat, max_lon, max_lat)
+    except (KeyError, TypeError) as e:
+        logger.error(f"Error parsing bounds: {e}")
+        return None
+
+def bbox_to_string(bbox: Tuple[float, float, float, float]) -> str:
+    """
+    Convert bbox tuple to string for caching.
+    
+    Args:
+        bbox: Tuple of (min_lon, min_lat, max_lon, max_lat)
+        
+    Returns:
+        String representation
+    """
+    return f"{bbox[0]:.4f},{bbox[1]:.4f},{bbox[2]:.4f},{bbox[3]:.4f}"
 
 # ============================================================================
-# MAP MANAGEMENT (Core map creation and manipulation functions)
+# MAP CREATION AND MANAGEMENT
 # ============================================================================
 
 class MapManager:
-    """Handles map creation and updates."""
+    """Handles map creation and store marker management."""
     
     @staticmethod
-    def create_base_map(center: List[float], zoom: int = MAP_CONFIG["zoom_start"]) -> folium.Map:
-        """Create a base Folium map centered at the given coordinates."""
-        return folium.Map(
+    def create_base_map(center: List[float], zoom: int) -> folium.Map:
+        """
+        Create a base Folium map.
+        
+        Args:
+            center: [latitude, longitude]
+            zoom: Zoom level
+            
+        Returns:
+            Folium Map object
+        """
+        m = folium.Map(
             location=center,
             zoom_start=zoom,
-            tiles=MAP_CONFIG["tiles"]
+            tiles=MAP_CONFIG["tiles"],
+            control_scale=True
         )
-
+        
+        return m
+    
     @staticmethod
-    def get_boundary_area(city_gdf: gpd.GeoDataFrame) -> float:
-        """Calculate boundary area, handling geographic vs projected CRS."""
-        if city_gdf.crs and city_gdf.crs.is_geographic:
-            # Reproject to projected CRS for accurate area calculation
-            city_gdf_projected = city_gdf.to_crs(epsg=3857)  # Web Mercator
-            return city_gdf_projected.geometry.area.sum()
-        return city_gdf.geometry.area.sum()
-
-    @staticmethod
-    def format_area(area: float) -> str:
-        """Format area value with appropriate unit."""
-        if area >= 1e6:
-            return f"{area / 1e6:.2f} million sq units"
-        elif area >= 1e3:
-            return f"{area / 1e3:.2f}K sq units"
-        return f"{area:,.2f} sq units"
-
-    @staticmethod
-    def add_city_boundary(m: folium.Map, city_gdf: gpd.GeoDataFrame) -> None:
-        """Add city boundary to the map."""
-        city_json = city_gdf.to_json()
-        folium.GeoJson(
-            city_json,
-            style_function=lambda x: GEOJSON_STYLE
-        ).add_to(m)
-
-    @staticmethod
-    def add_stores_to_map(m: folium.Map, stores_gdf: gpd.GeoDataFrame) -> None:
-        """Add store markers to the map with detailed information."""
-        if stores_gdf is None or stores_gdf.empty:
+    def add_store_markers(m: folium.Map, stores: List[Dict], use_clustering: bool = False) -> None:
+        """
+        Add store markers to the map.
+        
+        Args:
+            m: Folium map object
+            stores: List of store dictionaries
+            use_clustering: Whether to use marker clustering
+        """
+        if not stores:
             return
-            
-        for idx, row in stores_gdf.iterrows():
-            # Extract coordinates from point geometry
-            coords = row.geometry.coords[0]
-            
-            # Get store details
-            store_name = row.get('store_name', 'Unnamed Store')
-            shop_type = row.get('shop_type', 'Unknown')
-            
-            # Format distance if available
-            distance_text = ""
-            if 'distance' in row:
-                distance_meters = float(row['distance'])
-                if distance_meters < 1000:
-                    distance_text = f"<br>Distance: {distance_meters:.0f}m"
-                else:
-                    distance_text = f"<br>Distance: {distance_meters/1000:.1f}km"
-            
-            # Create detailed popup
-            popup_text = f"""
-                <div style='min-width: 200px'>
-                    <h4>{store_name}</h4>
-                    <b>Type:</b> {shop_type}
-                    {distance_text}
-                </div>
-            """
-            
-            # Add marker with custom icon based on shop type
-            icon_color = 'green'  # default
-            if shop_type == 'supermarket':
-                icon_color = 'red'
-            elif shop_type == 'convenience':
-                icon_color = 'orange'
-            elif shop_type == 'marketplace':
-                icon_color = 'blue'
-                
-            folium.Marker(
-                location=[coords[1], coords[0]],  # [lat, lon]
-                popup=folium.Popup(popup_text, max_width=300),
-                icon=folium.Icon(color=icon_color, icon='info-sign')
+        
+        # Create marker cluster if requested
+        if use_clustering and len(stores) > 50:
+            marker_cluster = MarkerCluster(
+                name="Grocery Stores",
+                overlay=True,
+                control=True
             ).add_to(m)
-
-    @staticmethod
-    def display_map(
-        city_gdf: gpd.GeoDataFrame, 
-        stores_gdf: Optional[gpd.GeoDataFrame] = None,
-        center: Optional[List[float]] = None
-    ) -> folium.Map:
-        """Create and return a map with city boundary and optional store markers."""
-        if center is None:
-            # Project to Web Mercator for accurate centroid calculation
-            if city_gdf.crs and city_gdf.crs.is_geographic:
-                # Convert to projected CRS for accurate centroid
-                projected = city_gdf.to_crs(epsg=3857)
-                # Calculate centroid and convert back to original CRS
-                bounds = projected.geometry.total_bounds
-                center_x = (bounds[0] + bounds[2]) / 2
-                center_y = (bounds[1] + bounds[3]) / 2
-                centroid_point = gpd.points_from_xy([center_x], [center_y], crs=3857)
-                centroid_point = centroid_point.to_crs(city_gdf.crs)[0]
-            else:
-                # If already in projected CRS, calculate centroid directly
-                bounds = city_gdf.geometry.total_bounds
-                center_x = (bounds[0] + bounds[2]) / 2
-                center_y = (bounds[1] + bounds[3]) / 2
-                centroid_point = gpd.points_from_xy([center_x], [center_y], crs=city_gdf.crs)[0]
+            add_to = marker_cluster
+        else:
+            add_to = m
+        
+        # Add markers
+        for store in stores:
+            try:
+                lat = store['latitude']
+                lon = store['longitude']
+                name = store['name']
+                shop_type = store['shop_type']
+                address = store.get('address', 'Address not available')
                 
-            # Extract coordinates from the centroid point
-            center = [centroid_point.coords[0][1], centroid_point.coords[0][0]]  # [lat, lon]
+                # Get color based on shop type
+                color = STORE_COLORS.get(shop_type, STORE_COLORS['unknown'])
+                
+                # Create popup content
+                popup_html = f"""
+                    <div style='min-width: 200px; font-family: Arial, sans-serif;'>
+                        <h4 style='margin-bottom: 8px; color: #2c3e50;'>{name}</h4>
+                        <p style='margin: 4px 0;'><b>Type:</b> {shop_type}</p>
+                        <p style='margin: 4px 0;'><b>Address:</b> {address or 'N/A'}</p>
+                        <p style='margin: 4px 0; font-size: 11px; color: #7f8c8d;'>
+                            📍 {lat:.4f}, {lon:.4f}
+                        </p>
+                    </div>
+                """
+                
+                # Add marker
+                folium.Marker(
+                    location=[lat, lon],
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=name,
+                    icon=folium.Icon(color=color, icon='shopping-cart', prefix='fa')
+                ).add_to(add_to)
+                
+            except Exception as e:
+                logger.error(f"Error adding marker for store: {e}")
+                continue
+    
+    @staticmethod
+    def create_map_with_stores(
+        center: List[float], 
+        zoom: int, 
+        stores: List[Dict],
+        show_stores: bool = True
+    ) -> folium.Map:
+        """
+        Create a map with store markers.
         
-        # Create and populate map
-        m = MapManager.create_base_map(center)
-        MapManager.add_city_boundary(m, city_gdf)
+        Args:
+            center: [latitude, longitude]
+            zoom: Zoom level
+            stores: List of store dictionaries
+            show_stores: Whether to show store markers
+            
+        Returns:
+            Folium Map object
+        """
+        m = MapManager.create_base_map(center, zoom)
         
-        if stores_gdf is not None and not stores_gdf.empty:
-            MapManager.add_stores_to_map(m, stores_gdf)
+        if show_stores and stores:
+            MapManager.add_store_markers(m, stores, use_clustering=(len(stores) > 50))
         
         return m
 
-    @staticmethod
-    def display_metrics(city_gdf: gpd.GeoDataFrame) -> None:
-        """Display boundary metrics in columns."""
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Geometry Type", city_gdf.geometry.type.iloc[0])
-        
-        with col2:
-            st.metric("Total Polygons", len(city_gdf))
-        
-        with col3:
-            total_area = MapManager.get_boundary_area(city_gdf)
-            st.metric("Total Area", MapManager.format_area(total_area))
-
 # ============================================================================
-# USER INTERFACE (UI rendering and display functions)
+# USER INTERFACE
 # ============================================================================
 
 class UserInterface:
@@ -291,347 +256,282 @@ class UserInterface:
             layout="wide",
             initial_sidebar_state="expanded"
         )
+        
         st.title("🗺️ Food Desert Mapper")
         st.markdown("""
-            This application helps you explore urban food deserts by visualizing city boundaries
-            and analyzing food availability across different neighborhoods.
+            Explore grocery store locations interactively. Pan and zoom the map to discover 
+            food access in different areas.
         """)
-
-    @staticmethod
-    def render_sidebar() -> Tuple[str, Optional[str]]:
-        """Get user inputs from sidebar."""
-        with st.sidebar:
-            st.header("Search Parameters")
-            
-            city = st.text_input(
-                "City Name:",
-                placeholder="e.g., New York City, London, Tokyo",
-                help="The name of the city you want to explore"
-            )
-            
-            country = st.text_input(
-                "Country (optional):",
-                placeholder="e.g., USA, UK, Japan",
-                help="Helps disambiguate cities with the same name"
-            )
-            
-            # Add helpful tips
-            st.markdown("---")
-            st.markdown(
-                "<small>💡 **Tip:** Adding a country name helps find the correct city "
-                "if there are multiple matches.</small>",
-                unsafe_allow_html=True
-            )
-            
-            return city, country if country else None
-
-    @staticmethod
-    def display_city_selection(matches: List[Dict]) -> Optional[int]:
-        """
-        Display UI for selecting from multiple city matches.
-        
-        Args:
-            matches: List of city match dictionaries
-            
-        Returns:
-            Selected OSM ID or None
-        """
-        st.warning(f"⚠️ Found {len(matches)} possible matches. Please select the correct city:")
-        
-        options = []
-        for i, match in enumerate(matches):
-            display_name = match.get('display_name', 'Unknown')
-            osm_type = match.get('osm_type', 'unknown')
-            place_rank = match.get('place_rank', 999)
-            options.append(f"{i+1}. {display_name} (Type: {osm_type}, Rank: {place_rank})")
-        
-        selected = st.radio("Select a city:", options, key="city_selectior")
-        
-        if selected:
-            selected_idx = int(selected.split(".")[0]) - 1
-            selected_match = matches[selected_idx]
-
-            with st.expander("📍 Selected City Details"):
-                st.write(f"**Name:** {selected_match.get('name', 'Unknown')}")
-                st.write(f"**Full Name:** {selected_match.get('display_name', 'Unknown')}")
-                st.write(f"**Type:** {selected_match.get('osm_type', 'Unknown')}")
-                st.write(f"**OSM ID:** {selected_match.get('osm_id', 'Unknown')}")
-                st.write(f"**Place Rank:** {selected_match.get('place_rank', 'Unknown')} (lower = more specific)")
-
-            if st.button("✅ Confirm Selection", type="primary"):
-                return selected_match.get('osm_id')
-        
-        return None
-
-    @staticmethod
-    def display_welcome():
-        """Display welcome message for new users."""
-        st.info(
-            "👋 **Welcome to the Food Desert Mapper!**\n\n"
-            "**How to use:**\n"
-            "1. Enter a city name in the sidebar\n"
-            "2. (Optional) Enter a country to disambiguate\n"
-            "3. Click 'Load City' to fetch and visualize the city boundary and grocery stores\n"
-            "4. Click 'Update Stores' to refresh store data from OpenStreetMap\n\n"
-            "All data will be saved to the database for future analysis."
-        )
     
     @staticmethod
-    def display_footer():
-        """Display page footer."""
-        st.markdown("---")
-        st.markdown(
-            "<div style='text-align: center; color: gray;'>"
-            "<small>Food Desert Mapper | Powered by OpenStreetMap & GeoPandas</small>"
-            "</div>",
-            unsafe_allow_html=True
-        )
+    def render_sidebar() -> Tuple[bool, str]:
+        """
+        Render sidebar controls.
+        
+        Returns:
+            Tuple of (show_stores, search_address)
+        """
+        with st.sidebar:
+            st.header("⚙️ Controls")
+            
+            # Toggle for showing stores
+            show_stores = st.checkbox(
+                "Show Grocery Stores",
+                value=st.session_state.show_stores,
+                help="Toggle visibility of grocery store markers"
+            )
+            
+            st.markdown("---")
+            
+            # Address search
+            st.subheader("📍 Search Location")
+            search_address = st.text_input(
+                "Enter an address:",
+                placeholder="e.g., 123 Main St, New Brunswick, NJ",
+                help="Search for an address to move the map"
+            )
+            
+            search_button = st.button("🔍 Search", use_container_width=True)
+            
+            st.markdown("---")
+            
+            # Legend
+            st.subheader("🎨 Store Types")
+            st.markdown("""
+                <div style='font-size: 14px;'>
+                    🔴 <b>Supermarket</b><br>
+                    🟢 <b>Grocery</b><br>
+                    🟠 <b>Convenience</b><br>
+                    🔵 <b>Marketplace</b><br>
+                    ⚫ <b>Other</b>
+                </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Instructions
+            with st.expander("ℹ️ How to Use"):
+                st.markdown("""
+                    1. **Pan the map** to explore different areas
+                    2. **Zoom in/out** to adjust detail level
+                    3. **Click markers** to see store details
+                    4. **Search addresses** to jump to locations
+                    5. **Toggle stores** to show/hide markers
+                    
+                    Store data loads automatically as you navigate!
+                """)
+            
+            # Statistics
+            if st.session_state.current_bounds:
+                st.markdown("---")
+                st.subheader("📊 Statistics")
+                
+                # Get current viewport stores
+                bbox = calculate_bbox_from_bounds(st.session_state.current_bounds)
+                
+                if bbox:
+                    bbox_str = bbox_to_string(bbox)
+                    
+                    if bbox_str in st.session_state.stores_cache:
+                        store_count = len(st.session_state.stores_cache[bbox_str])
+                        st.metric("Stores in View", store_count)
+            
+            return show_stores, search_address if search_button else ""
+    
+    @staticmethod
+    def display_info_box(message: str, type: str = "info"):
+        """
+        Display an info box.
+        
+        Args:
+            message: Message to display
+            type: Type of message (info, success, warning, error)
+        """
+        if type == "info":
+            st.info(message)
+        elif type == "success":
+            st.success(message)
+        elif type == "warning":
+            st.warning(message)
+        elif type == "error":
+            st.error(message)
 
 # ============================================================================
-# APPLICATION LOGIC (Core business logic and state management)
+# APPLICATION LOGIC
 # ============================================================================
 
 class AppLogic:
-    """Handles main application logic and state management."""
-
-    @staticmethod
-    def clear_city_state():
-        """Clear all city-related session state."""
-        st.session_state.city_gdf = None
-        st.session_state.stores_gdf = None
-        st.session_state.stores_updated = False
-        st.session_state.total_stores = 0
-        st.session_state.new_stores = 0
-        st.session_state.last_update_time = None
+    """Handles main application logic."""
     
     @staticmethod
-    def update_stores(
-        city_name: str, 
-        country_name: Optional[str] = None
-    ) -> Tuple[int, int]:
+    def handle_address_search(address: str) -> Optional[Tuple[float, float]]:
         """
-        Update store data for selected city.
+        Handle address search and update map center.
         
         Args:
-            city_name: Name of the city to update stores for
-            country_name: Optional country name for disambiguation
+            address: Address to search for
             
         Returns:
-            Tuple containing:
-            - total_stores: Total number of stores in the city
-            - new_stores: Number of newly added stores
-            
-        Note: Existing stores will be updated if their data has changed.
+            Tuple of (latitude, longitude) or None
         """
-        logger.info(f"Updating stores for {city_name}")
-        try:
-            total_stores, new_stores = DataManager.update_city_stores(city_name, country_name)
-            
-            # Update session state
-            st.session_state.stores_updated = True
-            st.session_state.last_update_time = pd.Timestamp.now()
-            st.session_state.total_stores = total_stores
-            st.session_state.new_stores = new_stores
-
-            # Reload stores for display
-            stores_gdf = DataManager.get_all_city_stores(city_name, country_name)
-            st.session_state.stores_gdf = stores_gdf
-            
-            # Log results
-            if new_stores > 0:
-                logger.info(f"Added {new_stores} new stores")
-            else:
-                logger.info("No new stores added")
-                
-            return total_stores, new_stores
-            
-        except Exception as e:
-            logger.error(f"Failed to update stores: {e}")
-            st.session_state.stores_updated = False
-            raise
+        coords = geocode_address(address)
+        
+        if coords:
+            st.session_state.map_center = list(coords)
+            st.session_state.map_zoom = 15  # Zoom in when searching
+            logger.info(f"Updated map center to {coords}")
+            return coords
+        
+        return None
     
     @staticmethod
-    def process_city_selection(
-        city_name: str, 
-        country_name: Optional[str] = None,
-        osm_id: Optional[int] = None
-    ) -> Tuple[Optional[gpd.GeoDataFrame], Optional[List[Dict]]]:
+    def load_stores_for_bounds(bounds: Dict) -> List[Dict]:
         """
-        Process city selection and return boundary data or matches.
+        Load stores for the current map bounds.
         
+        Args:
+            bounds: Map bounds dictionary
+            
         Returns:
-            Tuple of (GeoDataFrame or None, List of matches or None)
+            List of store dictionaries
         """
-        logger.info(f"Processing city: '{city_name}', country: '{country_name}', osm_id: {osm_id}")
-        
-        # Input validation and cleaning
-        if not isinstance(city_name, str):
-            raise ValueError("City name must be a non-empty string.")
-            
-        city_name = city_name.strip()
-        if not city_name:
-            raise ValueError("City name cannot be empty or whitespace only.")
-        
-        country_name = country_name.strip() if country_name and isinstance(country_name, str) else None
-        
         try:
-            AppLogic.clear_city_state()
-
-            result = DataManager.load_city_boundary(city_name, country_name, osm_id)
+            bbox = calculate_bbox_from_bounds(bounds)
+            if not bbox:
+                logger.warning("Could not calculate bbox from bounds")
+                return []
             
-            # Check if we got multiple matches
-            if isinstance(result, tuple):
-                # Multiple matches found
-                _, matches = result
-                logger.info(f"Found {len(matches)} matches for '{city_name}'")
-                return None, matches
+            # Check cache first
+            bbox_str = bbox_to_string(bbox)
             
-            # Single match found
-            city_gdf = result
+            if bbox_str in st.session_state.stores_cache:
+                logger.info(f"Using cached stores for {bbox_str}")
+                return st.session_state.stores_cache[bbox_str]
             
-            if city_gdf is None or city_gdf.empty:
-                raise RuntimeError(f"No boundary data found for '{city_name}'")
-
-            # Update session state
-            st.session_state.city_gdf = city_gdf
-            st.session_state.current_city = city_name
-            st.session_state.current_country = country_name
-            st.session_state.available_matches = None
-
-            logger.info(f"Successfully processed city selection for {city_name}")
-            return city_gdf, None
-
+            # Fetch from database/OSM
+            logger.info(f"Fetching stores for bbox: {bbox}")
+            stores = fetch_stores_in_bbox(bbox)
+            
+            # Cache the results
+            st.session_state.stores_cache[bbox_str] = stores
+            
+            # Limit cache size to prevent memory issues
+            if len(st.session_state.stores_cache) > 20:
+                # Remove oldest entry
+                oldest_key = next(iter(st.session_state.stores_cache))
+                del st.session_state.stores_cache[oldest_key]
+            
+            logger.info(f"Loaded {len(stores)} stores for viewport")
+            return stores
+            
         except Exception as e:
-            logger.error(f"Failed to process city selection: {e}")
-            raise
+            logger.error(f"Error loading stores: {e}")
+            return []
 
 # ============================================================================
-# MAIN APPLICATION (Entry point and main execution flow)
+# MAIN APPLICATION
 # ============================================================================
 
 def main():
     """Main application function."""
+    
     # Initialize UI
     UserInterface.render_header()
     
     try:
-        # Get user inputs
-        city_name, country_name = UserInterface.render_sidebar()
-
-        # Add action buttons
-        col1, col2 = st.sidebar.columns(2)
-        load_button = col1.button("🔍 Load City", use_container_width=True)
-        update_button = col2.button("🔄 Update Stores", use_container_width=True)
-
-        # Handel city loading
-        if load_button and city_name:
-            st.session_state.pending_city_name = city_name
-            st.session_state.pending_country_name = country_name
-
-            with st.spinner(f"🔍 Fetching boundary for {city_name}..."):
-                city_gdf, matches = AppLogic.process_city_selection(city_name, country_name)
-
-                if matches:
-                    if len(matches) > 1:
-                        st.session_state.available_matches = matches
-                        st.rerun()
-
-                    else:
-                        single_osm_id = matches[0].get('osm_id')
-                        city_gdf, _ = AppLogic.process_city_selection(
-                            city_name, 
-                            country_name, 
-                            osm_id=single_osm_id
-                        )
-
-                        if city_gdf is not None:
-                            st.success(f"✅ Successfully loaded {city_name}!")
-                            st.session_state.available_matches = None
-                            st.rerun()
-
-                elif city_gdf is not None:
-                    st.success(f"✅ Successfully loaded {city_name}!")
-                    st.session_state.available_matches = None
-                    st.rerun()
-
-        # Handle multiple matches selection
-        if st.session_state.available_matches:
-            city_name = st.session_state.pending_city_name or st.session_state.current_city
-            country_name = st.session_state.pending_country_name or st.session_state.current_country
-
-            selected_osm_id = UserInterface.display_city_selection(st.session_state.available_matches)
-            
-            if selected_osm_id:
-                with st.spinner("🔍 Loading selected city..."):
-                    city_gdf, _ = AppLogic.process_city_selection(
-                        city_name, 
-                        country_name, 
-                        osm_id=selected_osm_id
-                    )
-                    if city_gdf is not None:
-                        st.success(f"✅ Successfully loaded {city_name}!")
-                        st.session_state.pending_city_name = None
-                        st.session_state.pending_country_name = None
-                        st.session_state.available_matches = None
-                        st.rerun()
-
-        # Handle store updates
-        if update_button and st.session_state.city_gdf is not None:
-            with st.spinner("🔄 Updating store data..."):
-                total_stores, new_stores = AppLogic.update_stores(
-                    st.session_state.current_city,
-                    st.session_state.current_country
-                )
-                
-                if new_stores > 0:
-                    st.success(f"✅ Added {new_stores} new stores!")
-
-                else:
-                    st.info(f"ℹ️ Database is up to date ({total_stores} stores)")
+        # Render sidebar and get controls
+        show_stores, search_address = UserInterface.render_sidebar()
+        
+        # Update session state
+        st.session_state.show_stores = show_stores
+        
+        # Handle address search
+        if search_address:
+            coords = AppLogic.handle_address_search(search_address)
+            if coords:
+                st.success(f"✅ Found location: {coords[0]:.4f}, {coords[1]:.4f}")
                 st.rerun()
-
-        # Display content based on state
-        if st.session_state.city_gdf is not None and not st.session_state.available_matches:
-            st.markdown("---")
-            MapManager.display_metrics(st.session_state.city_gdf)
-            st.markdown("---")
-
-            st.subheader("🗺️ City Boundary & Grocery Stores")
-
-            # Display store count if available
-            if st.session_state.stores_gdf is not None and not st.session_state.stores_gdf.empty:
-                st.info(f"📊 Showing {len(st.session_state.stores_gdf)} grocery stores")
-
-            # Create and display map
-            map_key = f"map_{st.session_state.current_city}_{st.session_state.current_country}"
-            m = MapManager.display_map(
-                st.session_state.city_gdf,
-                st.session_state.stores_gdf
-            )
-            st_folium(m, width=700, height=500, key=map_key)
-
-        elif not st.session_state.available_matches:
-            UserInterface.display_welcome()
-
-    except ValueError as val_error:
-        st.error(f"❌ Input Error: {str(val_error)}")
-        logger.error(f"Validation error: {val_error}")
+            else:
+                st.error("❌ Could not find address. Please try a different search.")
+        
+        # Create map
+        stores = []
+        if show_stores:
+            # Use cached bounds or default
+            if st.session_state.current_bounds:
+                stores = AppLogic.load_stores_for_bounds(st.session_state.current_bounds)
+            else:
+                # Initial load - get stores around default center
+                default_bbox = (
+                    DEFAULT_CENTER[1] - 0.05,  # min_lon
+                    DEFAULT_CENTER[0] - 0.05,  # min_lat
+                    DEFAULT_CENTER[1] + 0.05,  # max_lon
+                    DEFAULT_CENTER[0] + 0.05   # max_lat
+                )
+                stores = fetch_stores_in_bbox(default_bbox)
+        
+        # Create and display map
+        m = MapManager.create_map_with_stores(
+            st.session_state.map_center,
+            st.session_state.map_zoom,
+            stores,
+            show_stores
+        )
+        
+        # Display map and capture interactions
+        map_data = st_folium(
+            m,
+            width=MAP_CONFIG["width"],
+            height=MAP_CONFIG["height"],
+            returned_objects=["bounds", "center", "zoom"]
+        )
+        
+        # Update session state with new map position
+        if map_data:
+            if map_data.get("bounds"):
+                st.session_state.current_bounds = map_data["bounds"]
+                
+                # Load stores for new bounds if they've changed significantly
+                new_stores = AppLogic.load_stores_for_bounds(map_data["bounds"])
+                
+                # Only rerun if we got new stores and stores are being shown
+                if show_stores and new_stores and len(new_stores) != len(stores):
+                    logger.info("Bounds changed, reloading stores")
+                    # Note: Automatic rerun might cause issues, so we'll let user navigate naturally
+            
+            if map_data.get("center"):
+                st.session_state.map_center = [
+                    map_data["center"]["lat"],
+                    map_data["center"]["lng"]
+                ]
+            
+            if map_data.get("zoom"):
+                st.session_state.map_zoom = map_data["zoom"]
+        
+        # Display store count
+        if show_stores and stores:
+            st.info(f"📊 Showing {len(stores)} grocery stores in the current view")
         
     except Exception as e:
-        st.error(f"❌ An error occurred: {str(e)}")
         logger.error(f"Application error: {e}", exc_info=True)
+        st.error(f"❌ An error occurred: {str(e)}")
         
-        # Show troubleshooting tips
-        with st.expander("🔧 Troubleshooting Tips"):
+        with st.expander("🔧 Troubleshooting"):
             st.markdown("""
-            - Verify the spelling of the city name
-            - Try adding the country name for disambiguation
-            - Check your internet connection
-            - Ensure the database is properly configured
-            - Check logs for detailed error information
+                - Check your internet connection
+                - Verify database is running and accessible
+                - Try refreshing the page
+                - Check logs for detailed error information
             """)
-
-    UserInterface.display_footer()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align: center; color: gray;'>"
+        "<small>Food Desert Mapper | Powered by OpenStreetMap & GeoPandas</small>"
+        "</div>",
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
