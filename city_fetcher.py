@@ -9,7 +9,7 @@ This module handles:
 """
 
 import logging
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Any, Tuple
 import geopandas as gpd
 import osmnx as ox
 from shapely.geometry import Polygon, MultiPolygon
@@ -72,7 +72,7 @@ def fetch_city_boundary(
     city: str,
     state: str,
     country: str = "USA",
-    which_result: Optional[int] = None
+    which_result: Optional[int] = 1
 ) -> Optional[gpd.GeoDataFrame]:
     """
     Fetch city administrative boundary from OpenStreetMap.
@@ -81,7 +81,8 @@ def fetch_city_boundary(
         city: City name (e.g., "Philadelphia")
         state: State name (e.g., "Pennsylvania")
         country: Country name (default: "USA")
-        which_result: If multiple results, specify which one (1-indexed)
+        which_result: Which result to return if multiple matches (1-indexed, default: 1)
+                     Use None to get all results in a single GeoDataFrame
         
     Returns:
         GeoDataFrame with city boundary or None if not found
@@ -123,87 +124,15 @@ def fetch_city_boundary(
         if gdf.crs != 'EPSG:4326':
             gdf = gdf.to_crs('EPSG:4326')
         
-        logger.info(f"Successfully fetched boundary for {city}, {state}")
-        logger.info(f"Area: {gdf['area_km2'].iloc[0]:.2f} km²")
+        num_results = len(gdf)
+        logger.info(f"Successfully fetched {num_results} boundary(ies) for {city}, {state}")
+        if num_results == 1:
+            logger.info(f"Area: {gdf['area_km2'].iloc[0]:.2f} km²")
         
         return gdf
         
     except Exception as e:
         logger.error(f"Error fetching city boundary: {e}")
-        return None
-    
-def fetch_all_city_boundaries(
-    city: str,
-    state: str,
-    country: str = "USA"
-) -> Optional[List[gpd.GeoDataFrame]]:
-    """
-    Fetch all possible boundaries for a city (handles multiple results).
-    
-    Args:
-        city: City name
-        state: State name
-        country: Country name
-        
-    Returns:
-        List of GeoDataFrames with all matching boundaries, or None if error
-    """
-    # Validate inputs
-    if not validate_inputs(city, state, country):
-        return None
-    
-    try:
-        query = build_query_string(city, state, country)
-        logger.info(f"Fetching all boundaries for: {query}")
-        
-        # Fetch all results
-        gdf = ox.geocode_to_gdf(query, which_result=None)
-        
-        if gdf is None or gdf.empty:
-            logger.warning(f"No boundaries found for: {query}")
-            return None
-        
-        # If single result, return as list
-        if len(gdf) == 1:
-            gdf['name'] = city.strip()
-            gdf['state'] = state.strip()
-            gdf['country'] = country.strip()
-            gdf['area_km2'] = calculate_area(gdf)
-            
-            if 'osmid' in gdf.columns:
-                gdf['osm_id'] = gdf['osmid']
-            else:
-                gdf['osm_id'] = 0
-                
-            if gdf.crs != 'EPSG:4326':
-                gdf = gdf.to_crs('EPSG:4326')
-                
-            return [gdf]
-        
-        # Multiple results - split into separate GeoDataFrames
-        results = []
-        for idx in range(len(gdf)):
-            single_gdf = gdf.iloc[[idx]].copy()
-            single_gdf['name'] = city.strip()
-            single_gdf['state'] = state.strip()
-            single_gdf['country'] = country.strip()
-            single_gdf['area_km2'] = calculate_area(single_gdf)
-            
-            if 'osmid' in single_gdf.columns:
-                single_gdf['osm_id'] = single_gdf['osmid']
-            else:
-                single_gdf['osm_id'] = 0
-                
-            if single_gdf.crs != 'EPSG:4326':
-                single_gdf = single_gdf.to_crs('EPSG:4326')
-                
-            results.append(single_gdf)
-        
-        logger.info(f"Found {len(results)} boundaries for {city}, {state}")
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error fetching boundaries: {e}")
         return None
     
 def validate_boundary(gdf: gpd.GeoDataFrame) -> bool:
@@ -231,13 +160,13 @@ def validate_boundary(gdf: gpd.GeoDataFrame) -> bool:
         logger.error("Geometry is None")
         return False
     
-    if not geom.is_valid:
-        logger.error("Geometry is not valid")
-        return False
-    
-    # Check that it's a Polygon or MultiPolygon
+    # Type check for Shapely geometry
     if not isinstance(geom, (Polygon, MultiPolygon)):
         logger.error(f"Geometry must be Polygon or MultiPolygon, got {type(geom)}")
+        return False
+    
+    if not geom.is_valid:
+        logger.error("Geometry is not valid")
         return False
     
     # Check that it's not empty
@@ -272,7 +201,7 @@ def calculate_area(gdf: gpd.GeoDataFrame) -> float:
         logger.error(f"Error calculating area: {e}")
         return 0.0
     
-def get_boundary_info(gdf: gpd.GeoDataFrame) -> Dict[str, any]:
+def get_boundary_info(gdf: gpd.GeoDataFrame) -> Dict[str, Any]:
     """
     Extract summary information about a boundary.
     
@@ -314,7 +243,14 @@ def get_boundary_center(gdf: gpd.GeoDataFrame) -> Optional[Tuple[float, float]]:
         if gdf is None or gdf.empty:
             return None
         
-        centroid = gdf.geometry.iloc[0].centroid
+        geom = gdf.geometry.iloc[0]
+        
+        # Type check for Shapely geometry
+        if not isinstance(geom, (Polygon, MultiPolygon)):
+            logger.error("Geometry must be Polygon or MultiPolygon")
+            return None
+        
+        centroid = geom.centroid
         return (centroid.y, centroid.x)  # (lat, lon)
         
     except Exception as e:
@@ -379,7 +315,8 @@ def ensure_multipolygon(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
                 logger.warning(f"Unexpected geometry type: {type(geom)}")
                 return geom
         
-        gdf_copy.geometry = gdf_copy.geometry.apply(to_multipolygon)
+        # Apply to each geometry in the GeoSeries
+        gdf_copy['geometry'] = gdf_copy.geometry.map(to_multipolygon)
         
         return gdf_copy
         
