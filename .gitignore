@@ -1,37 +1,53 @@
-# Virtual Environment
-.venv/
-venv/
-ENV/
-
-# Python cache files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
-dist/
-build/
-*.egg-info/
-
 # Environment variables
 .env
 
-# VS Code settings
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Database files
-*.db
-*.sqlite3
+# Jupyter Notebooks
+.ipynb_checkpoints
 
-# Cache directories
-data/cache/
+# OS
+.DS_Store
+Thumbs.db
 
 # Logs
 *.log
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Database
+*.db
+*.sqlite
 
-# OSMnx cache
-*.osm
-*.osm.pbf
+# Streamlit
+.streamlit/secrets.toml
