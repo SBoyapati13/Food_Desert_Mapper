@@ -6,7 +6,7 @@ including distance calculations and geometry manipulation.
 """
 
 import logging
-from typing import Tuple, Optional, List, Union
+from typing import Tuple, Optional, Union
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import unary_union
