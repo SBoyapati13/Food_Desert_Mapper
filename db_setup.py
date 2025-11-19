@@ -425,7 +425,12 @@ def get_city_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
     """
     try:
         config = DatabaseConfig()
-        engine = create_engine(config.get_connection_string())
+        connection_string = config.get_connection_string()
+        
+        logger.info(f"Connecting to database for city_id {city_id}")
+        logger.debug(f"Connection string (masked): postgresql://{config.user}:****@{config.host}:{config.port}/{config.database}")
+        
+        engine = create_engine(connection_string)
         
         query = """
             SELECT 
@@ -443,7 +448,12 @@ def get_city_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
             params=(city_id,)
         )
         
-        return gdf if not gdf.empty else None
+        if gdf.empty:
+            logger.warning(f"No city found with id {city_id}")
+            return None
+        
+        logger.info(f"Successfully retrieved city_id {city_id}")
+        return gdf
         
     except Exception as e:
         logger.error(f"Error retrieving city from database: {e}")
@@ -461,7 +471,12 @@ def get_stores_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
     """
     try:
         config = DatabaseConfig()
-        engine = create_engine(config.get_connection_string())
+        connection_string = config.get_connection_string()
+        
+        logger.info(f"Connecting to database for city_id {city_id}")
+        logger.debug(f"Connection string (masked): postgresql://{config.user}:****@{config.host}:{config.port}/{config.database}")
+        
+        engine = create_engine(connection_string)
         
         query = """
             SELECT 

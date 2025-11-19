@@ -7,7 +7,7 @@ to fresh food sources by mapping grocery store locations.
 
 import streamlit as st
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Import modules
 from config import Config
@@ -91,6 +91,14 @@ def initialize_session_state():
         st.session_state.current_state = None
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
+    if 'pending_city' not in st.session_state:
+        st.session_state.pending_city = None
+    if 'pending_state' not in st.session_state:
+        st.session_state.pending_state = None
+    if 'show_options' not in st.session_state:
+        st.session_state.show_options = False
+    if 'existing_city_id' not in st.session_state:
+        st.session_state.existing_city_id = None
 
 def render_header():
     """Render the application header."""
@@ -98,7 +106,7 @@ def render_header():
                 unsafe_allow_html=True)
     st.markdown(f'<div class="sub-header">{Config.APP_DESCRIPTION}</div>', 
                 unsafe_allow_html=True)
-    
+
 def render_sidebar():
     """Render the sidebar with city selection."""
     st.sidebar.header("📍 Select a City")
@@ -139,8 +147,63 @@ def render_sidebar():
                 st.sidebar.error("Invalid state name")
                 return
             
-            # Process the request
-            process_city_request(city, state)
+            # Store pending city info
+            st.session_state.pending_city = city
+            st.session_state.pending_state = state
+            
+            # Check if city exists in database
+            existing_city = check_city_exists(city, state, Config.DEFAULT_COUNTRY)
+            
+            if existing_city:
+                # Show options
+                st.session_state.show_options = True
+                st.session_state.existing_city_id = existing_city['id']
+                st.rerun()
+            else:
+                # Fetch new data directly
+                st.session_state.show_options = False
+                fetch_new_data(city, state)
+                st.session_state.current_city = city
+                st.session_state.current_state = state
+                st.rerun()
+    
+    # Show options if city exists in database
+    if st.session_state.show_options and st.session_state.existing_city_id:
+        existing_city = check_city_exists(
+            st.session_state.pending_city, 
+            st.session_state.pending_state, 
+            Config.DEFAULT_COUNTRY
+        )
+        
+        if existing_city:
+            st.sidebar.info(f"Found existing data from {existing_city['fetched_at'].strftime('%Y-%m-%d')}")
+            
+            col1, col2 = st.sidebar.columns(2)
+            
+            use_existing = col1.button("Use Existing", use_container_width=True, key="use_existing")
+            re_fetch = col2.button("Re-fetch", use_container_width=True, key="re_fetch")
+            
+            if use_existing:
+                logger.info(f"Use Existing clicked for city_id: {st.session_state.existing_city_id}")
+                load_existing_data(st.session_state.existing_city_id)
+                st.session_state.current_city = st.session_state.pending_city
+                st.session_state.current_state = st.session_state.pending_state
+                st.session_state.show_options = False
+                st.session_state.existing_city_id = None
+                st.session_state.pending_city = None
+                st.session_state.pending_state = None
+                st.rerun()
+            
+            if re_fetch:
+                logger.info(f"Re-fetch clicked for: {st.session_state.pending_city}, {st.session_state.pending_state}")
+                fetch_new_data(st.session_state.pending_city, st.session_state.pending_state)
+                st.session_state.current_city = st.session_state.pending_city
+                st.session_state.current_state = st.session_state.pending_state
+                st.session_state.show_options = False
+                st.session_state.existing_city_id = None
+                st.session_state.pending_city = None
+                st.session_state.pending_state = None
+                st.rerun()
     
     # Display current data info if loaded
     if st.session_state.data_loaded and st.session_state.city_info:
@@ -159,41 +222,6 @@ def render_sidebar():
             clear_session_state()
             st.rerun()
 
-def process_city_request(city: str, state: str):
-    """
-    Process a city data request.
-    
-    Args:
-        city: City name
-        state: State name
-    """
-    # Check if city exists in database
-    existing_city = check_city_exists(city, state, Config.DEFAULT_COUNTRY)
-    
-    if existing_city:
-        # Ask user if they want to use existing data or re-fetch
-        st.sidebar.info(f"Found existing data from {existing_city['fetched_at'].strftime('%Y-%m-%d')}")
-        
-        col1, col2 = st.sidebar.columns(2)
-        
-        if col1.button("Use Existing", use_container_width=True):
-            load_existing_data(existing_city['id'])
-            st.session_state.current_city = city
-            st.session_state.current_state = state
-            st.rerun()
-        
-        if col2.button("Re-fetch", use_container_width=True):
-            fetch_new_data(city, state)
-            st.session_state.current_city = city
-            st.session_state.current_state = state
-            st.rerun()
-    else:
-        # Fetch new data
-        fetch_new_data(city, state)
-        st.session_state.current_city = city
-        st.session_state.current_state = state
-        st.rerun()
-
 def load_existing_data(city_id: int):
     """
     Load existing data from database.
@@ -201,28 +229,40 @@ def load_existing_data(city_id: int):
     Args:
         city_id: City ID in database
     """
-    with st.spinner("Loading data from database..."):
-        # Load boundary
-        boundary_gdf = get_city_from_db(city_id)
-        
-        if boundary_gdf is None or boundary_gdf.empty:
-            st.error("Failed to load city boundary from database")
-            return
-        
-        # Load stores
-        stores_gdf = get_stores_from_db(city_id)
-        
-        if stores_gdf is None:
-            st.error("Failed to load stores from database")
-            return
-        
-        # Update session state
-        st.session_state.boundary_gdf = boundary_gdf
-        st.session_state.stores_gdf = stores_gdf
-        st.session_state.city_info = get_boundary_info(boundary_gdf)
-        st.session_state.data_loaded = True
-        
-        st.sidebar.success("Data loaded successfully!")
+    try:
+        with st.spinner("Loading data from database..."):
+            # Load boundary
+            boundary_gdf = get_city_from_db(city_id)
+            
+            if boundary_gdf is None or boundary_gdf.empty:
+                st.sidebar.error("Failed to load city boundary from database")
+                logger.error(f"Failed to load boundary for city_id {city_id}")
+                return
+            
+            # Load stores
+            stores_gdf = get_stores_from_db(city_id)
+            
+            if stores_gdf is None:
+                st.sidebar.error("Failed to load stores from database")
+                logger.error(f"Failed to load stores for city_id {city_id}")
+                return
+            
+            # Empty stores GeoDataFrame is OK (city might have no stores)
+            if stores_gdf.empty:
+                logger.info(f"No stores found for city_id {city_id}")
+            
+            # Update session state
+            st.session_state.boundary_gdf = boundary_gdf
+            st.session_state.stores_gdf = stores_gdf
+            st.session_state.city_info = get_boundary_info(boundary_gdf)
+            st.session_state.data_loaded = True
+            
+            st.sidebar.success("Data loaded successfully!")
+            logger.info(f"Successfully loaded data for city_id {city_id}")
+            
+    except Exception as e:
+        st.sidebar.error(f"Error loading data: {str(e)}")
+        logger.error(f"Exception loading data for city_id {city_id}: {e}", exc_info=True)
 
 def fetch_new_data(city: str, state: str):
     """
@@ -290,6 +330,10 @@ def clear_session_state():
     st.session_state.current_city = None
     st.session_state.current_state = None
     st.session_state.data_loaded = False
+    st.session_state.pending_city = None
+    st.session_state.pending_state = None
+    st.session_state.show_options = False
+    st.session_state.existing_city_id = None
 
 def render_statistics():
     """Render statistics about the current city."""
@@ -417,7 +461,7 @@ def render_map():
         )
         
         # Display map
-        st_folium(m, width=1200, height=600)
+        st_folium(m, width=1200, height=600, returned_objects=[])
 
 def main():
     """Main application function."""
@@ -448,7 +492,6 @@ def main():
         
         **Data Source:** OpenStreetMap
         """)
-
 
 if __name__ == "__main__":
     main()
