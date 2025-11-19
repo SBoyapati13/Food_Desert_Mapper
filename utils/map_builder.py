@@ -14,6 +14,8 @@ import folium
 from folium.plugins import MarkerCluster
 import geopandas as gpd
 from shapely.geometry import Polygon, MultiPolygon
+from branca.element import MacroElement
+from jinja2 import Template
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -225,22 +227,31 @@ def create_legend(store_types: List[str]) -> str:
     Returns:
         HTML string for legend
     """
+    # Use absolute positioning within the map container
     legend_html = '''
-    <div style="
-        position: fixed;
-        bottom: 50px;
-        right: 50px;
-        width: 200px;
+    <div id="map-legend" style="
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        width: 220px;
         background-color: white;
-        border: 2px solid grey;
-        border-radius: 5px;
-        padding: 10px;
-        font-family: Arial, sans-serif;
-        font-size: 12px;
-        z-index: 9999;
-        box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
+        border: 2px solid #333;
+        border-radius: 8px;
+        padding: 15px;
+        font-family: 'Arial', sans-serif;
+        font-size: 13px;
+        z-index: 1000;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        pointer-events: auto;
     ">
-        <h4 style="margin: 0 0 10px 0;">Store Types</h4>
+        <h4 style="
+            margin: 0 0 12px 0;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #ddd;
+            color: #333;
+            font-size: 15px;
+            font-weight: bold;
+        ">Store Types</h4>
     '''
     
     for store_type in store_types:
@@ -248,17 +259,22 @@ def create_legend(store_types: List[str]) -> str:
         display_name = store_type.replace('_', ' ').title()
         
         legend_html += f'''
-        <div style="margin: 5px 0;">
+        <div style="
+            margin: 8px 0;
+            display: flex;
+            align-items: center;
+        ">
             <span style="
                 display: inline-block;
-                width: 12px;
-                height: 12px;
+                width: 14px;
+                height: 14px;
                 background-color: {color};
                 border-radius: 50%;
-                margin-right: 5px;
-                border: 1px solid #333;
+                margin-right: 8px;
+                border: 2px solid #333;
+                flex-shrink: 0;
             "></span>
-            {display_name}
+            <span style="color: #333;">{display_name}</span>
         </div>
         '''
     
@@ -281,11 +297,31 @@ def add_legend_to_map(
         Updated Folium Map object
     """
     try:
+        if not store_types:
+            logger.warning("No store types provided for legend")
+            return map_obj
+        
         legend_html = create_legend(store_types)
-        map_obj.get_root().add_child(folium.Element(legend_html))
+        
+        # Wrap the legend in a template
+        template = """
+        {% macro html(this, kwargs) %}
+        """ + legend_html + """
+        {% endmacro %}
+        """
+        
+        macro = MacroElement()
+        macro._template = Template(template)
+        
+        # Add to the map's HTML
+        map_obj.get_root().add_child(macro)
+        
+        logger.info(f"Added legend with {len(store_types)} store types")
         return map_obj
+        
     except Exception as e:
         logger.error(f"Error adding legend to map: {e}")
+        logger.error(traceback.format_exc())
         return map_obj
     
 def create_full_map(
