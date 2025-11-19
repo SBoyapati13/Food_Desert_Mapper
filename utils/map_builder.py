@@ -6,6 +6,7 @@ for visualizing city boundaries and grocery store locations.
 """
 
 import logging
+import traceback
 import sys
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -71,8 +72,21 @@ def add_boundary_to_map(
             logger.warning("Empty boundary GeoDataFrame")
             return map_obj
         
+        # Create a copy to avoid modifying the original
+        boundary_copy = boundary_gdf.copy()
+
+        # Convert any datetime/timestamp columns to strings for JSON serialization
+        for col in boundary_copy.columns:
+            if col != 'geometry' and boundary_copy[col].dtype == 'datetime64[ns]':
+                boundary_copy[col] = boundary_copy[col].astype(str)
+            elif col != 'geometry' and hasattr(boundary_copy[col].iloc[0], 'isoformat'):
+                # Handle pandas Timestamp objects
+                boundary_copy[col] = boundary_copy[col].apply(
+                    lambda x: x.isoformat() if hasattr(x, 'isoformat') else str(x)
+                )
+        
         # Convert to GeoJSON
-        boundary_geojson = boundary_gdf.to_json()
+        boundary_geojson = boundary_copy.to_json()
         
         # Add boundary to map
         folium.GeoJson(
@@ -85,14 +99,14 @@ def add_boundary_to_map(
                 'fillOpacity': Config.BOUNDARY_FILL_OPACITY
             },
             tooltip=folium.Tooltip(
-                f"<b>{boundary_gdf['name'].iloc[0]}, {boundary_gdf['state'].iloc[0]}</b><br>"
-                f"Area: {boundary_gdf['area_km2'].iloc[0]:.2f} km²"
+                f"<b>{boundary_copy['name'].iloc[0]}, {boundary_copy['state'].iloc[0]}</b><br>"
+                f"Area: {boundary_copy['area_km2'].iloc[0]:.2f} km²"
             )
         ).add_to(map_obj)
         
         # Zoom to boundary
         if zoom_to_bounds:
-            bounds = boundary_gdf.total_bounds
+            bounds = boundary_copy.total_bounds
             map_obj.fit_bounds([
                 [bounds[1], bounds[0]],  # Southwest
                 [bounds[3], bounds[2]]   # Northeast
@@ -102,6 +116,7 @@ def add_boundary_to_map(
         
     except Exception as e:
         logger.error(f"Error adding boundary to map: {e}")
+        logger.error(traceback.format_exc())
         return map_obj
     
 def add_stores_to_map(
@@ -127,6 +142,22 @@ def add_stores_to_map(
             logger.warning("Empty stores GeoDataFrame")
             return map_obj
         
+        # Create a copy to avoid modifying the original
+        stores_copy = stores_gdf.copy()
+        
+        # Convert any datetime/timestamp columns to strings for JSON serialization
+        for col in stores_copy.columns:
+            if col != 'geometry' and stores_copy[col].dtype == 'datetime64[ns]':
+                stores_copy[col] = stores_copy[col].astype(str)
+            elif col != 'geometry' and hasattr(stores_copy[col].iloc[0], 'isoformat'):
+                # Handle pandas Timestamp objects
+                try:
+                    stores_copy[col] = stores_copy[col].apply(
+                        lambda x: x.isoformat() if hasattr(x, 'isoformat') else str(x)
+                    )
+                except:
+                    pass
+        
         # Create marker cluster if enabled
         if use_clusters and Config.USE_MARKER_CLUSTERS:
             marker_cluster = MarkerCluster(
@@ -139,7 +170,7 @@ def add_stores_to_map(
             parent = map_obj
         
         # Add each store as a marker
-        for idx, store in stores_gdf.iterrows():
+        for idx, store in stores_copy.iterrows():
             # Get coordinates
             lat = store.geometry.y
             lon = store.geometry.x
@@ -181,6 +212,7 @@ def add_stores_to_map(
         
     except Exception as e:
         logger.error(f"Error adding stores to map: {e}")
+        logger.error(traceback.format_exc())
         return map_obj
     
 def create_legend(store_types: List[str]) -> str:
