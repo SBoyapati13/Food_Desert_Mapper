@@ -8,6 +8,7 @@ This module handles:
 - Data retrieval and validation
 """
 import os
+import traceback
 import logging
 from typing import Optional, Dict
 from contextlib import contextmanager
@@ -342,8 +343,21 @@ def save_stores_to_db(stores_gdf: gpd.GeoDataFrame, city_id: int) -> int:
                 try:
                     geometry_wkt = row.geometry.wkt
 
-                    # Convert numpy types to Python types
-                    osm_id = int(row.get('osm_id', 0))
+                    # Handle OSM ID - it might be a string like 'node/123' or just an integer
+                    osm_id_raw = row.get('osm_id', 0)
+                    
+                    # Try to extract numeric ID from composite keys
+                    if isinstance(osm_id_raw, str):
+                        # Extract number from strings like 'node/123456' or 'way/789012'
+                        import re
+                        match = re.search(r'(\d+)', str(osm_id_raw))
+                        if match:
+                            osm_id = int(match.group(1))
+                        else:
+                            osm_id = hash(osm_id_raw) % (10 ** 15)  # Fallback: hash to bigint
+                    else:
+                        osm_id = int(osm_id_raw)
+                    
                     name = str(row.get('name', ''))
                     shop_type = str(row.get('shop_type', 'unknown'))
                     
@@ -359,17 +373,19 @@ def save_stores_to_db(stores_gdf: gpd.GeoDataFrame, city_id: int) -> int:
                         inserted_count += 1
                         
                 except Exception as e:
-                    logger.warning(f"Error inserting store {idx}: {e}")
+                    logger.warning(f"Error inserting store at index {idx}: {e}")
+                    logger.debug(f"Store data: osm_id={row.get('osm_id')}, name={row.get('name')}, type={row.get('shop_type')}")
                     continue
             
             conn.commit()
             cursor.close()
             
-            logger.info(f"Saved {inserted_count} stores to database")
+            logger.info(f"Saved {inserted_count}/{len(stores_gdf)} stores to database")
             return inserted_count
             
     except Exception as e:
         logger.error(f"Error saving stores to database: {e}")
+        logger.error(traceback.format_exc())
         return 0
     
 def check_city_exists(city: str, state: str, country: str = 'USA') -> Optional[Dict]:
@@ -436,7 +452,7 @@ def get_city_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
             SELECT 
                 id, name, state, country, osm_id, 
                 area_km2, fetched_at,
-                ST_AsText(boundary) as geometry
+                boundary as geometry
             FROM cities
             WHERE id = %s;
         """
@@ -445,7 +461,8 @@ def get_city_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
             query,
             engine,
             geom_col='geometry',
-            params=(city_id,)
+            params=(city_id,),
+            crs='EPSG:4326'  # Explicitly set CRS
         )
         
         if gdf.empty:
@@ -457,6 +474,7 @@ def get_city_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
         
     except Exception as e:
         logger.error(f"Error retrieving city from database: {e}")
+        logger.error(traceback.format_exc())
         return None
     
 def get_stores_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
@@ -481,7 +499,7 @@ def get_stores_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
         query = """
             SELECT 
                 id, city_id, osm_id, name, shop_type, fetched_at,
-                ST_AsText(location) as geometry
+                location as geometry
             FROM grocery_stores
             WHERE city_id = %s;
         """
@@ -490,13 +508,15 @@ def get_stores_from_db(city_id: int) -> Optional[gpd.GeoDataFrame]:
             query,
             engine,
             geom_col='geometry',
-            params=(city_id,)
+            params=(city_id,),
+            crs='EPSG:4326'  # Explicitly set CRS
         )
         
-        return gdf if not gdf.empty else None
+        return gdf if not gdf.empty else gpd.GeoDataFrame()
         
     except Exception as e:
         logger.error(f"Error retrieving stores from database: {e}")
+        logger.error(traceback.format_exc())
         return None
     
 def log_fetch_metadata(
