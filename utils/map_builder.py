@@ -261,7 +261,7 @@ def create_full_map(
     stores_gdf: gpd.GeoDataFrame,
     use_clusters: bool = True,
     add_legend: bool = True
-) -> Optional[folium.Map]:
+) -> folium.Map:
     """
     Create a complete map with boundary and stores.
     
@@ -282,7 +282,7 @@ def create_full_map(
             # Type check for Shapely geometry
             if not isinstance(geom, (Polygon, MultiPolygon)):
                 logger.error("Geometry must be Polygon or MultiPolygon")
-                return None
+                raise TypeError("Geometry must be Polygon or MultiPolygon")
 
             centroid = geom.centroid
             center = (centroid.y, centroid.x)  # (lat, lon)
