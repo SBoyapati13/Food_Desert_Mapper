@@ -263,6 +263,10 @@ def save_city_to_db(city_gdf: gpd.GeoDataFrame) -> Optional[int]:
         
         # Convert geometry to WKT
         geometry_wkt = row.geometry.wkt
+
+        # Convert numpy types to Python types
+        osm_id = int(row.get('osm_id', 0))
+        area_km2 = float(row.get('area_km2', 0.0)) if row.get('area_km2') is not None else None
         
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -279,14 +283,14 @@ def save_city_to_db(city_gdf: gpd.GeoDataFrame) -> Optional[int]:
                     fetched_at = NOW()
                 RETURNING id;
             """
-            
+
             cursor.execute(insert_sql, (
                 row.get('name', ''),
                 row.get('state', ''),
                 row.get('country', 'USA'),
-                row.get('osm_id', 0),
+                osm_id,
                 geometry_wkt,
-                row.get('area_km2', None)
+                area_km2
             ))
             
             result = cursor.fetchone()
@@ -337,12 +341,17 @@ def save_stores_to_db(stores_gdf: gpd.GeoDataFrame, city_id: int) -> int:
             for idx, row in stores_gdf.iterrows():
                 try:
                     geometry_wkt = row.geometry.wkt
+
+                    # Convert numpy types to Python types
+                    osm_id = int(row.get('osm_id', 0))
+                    name = str(row.get('name', ''))
+                    shop_type = str(row.get('shop_type', 'unknown'))
                     
                     cursor.execute(insert_sql, (
                         city_id,
-                        row.get('osm_id', 0),
-                        row.get('name', ''),
-                        row.get('shop_type', 'unknown'),
+                        osm_id,
+                        name,
+                        shop_type,
                         geometry_wkt
                     ))
                     
