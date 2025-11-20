@@ -203,7 +203,7 @@ def add_stores_to_map(
                 radius=6,
                 popup=folium.Popup(popup_html, max_width=300),
                 tooltip=name if name else shop_type.title(),
-                color=color,
+                color="black",
                 fill=True,
                 fillColor=color,
                 fillOpacity=0.7,
