@@ -28,7 +28,8 @@ from db_setup import (
     log_fetch_metadata
 )
 from utils.validation import validate_city_name, validate_state_name, sanitize_input
-from utils.map_builder import create_full_map
+from utils.map_builder import create_full_map, add_analysis_point_to_map
+from utils.geo_utils import find_nearest_store, count_stores_in_radius
 from streamlit_folium import st_folium
 
 # Configure logging
@@ -74,6 +75,27 @@ st.markdown("""
         font-size: 0.9rem;
         color: #666;
     }
+    .accessibility-good {
+        background-color: #d4edda;
+        border-left: 5px solid #28a745;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .accessibility-limited {
+        background-color: #fff3cd;
+        border-left: 5px solid #ffc107;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .accessibility-desert {
+        background-color: #f8d7da;
+        border-left: 5px solid #dc3545;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -99,6 +121,12 @@ def initialize_session_state():
         st.session_state.show_options = False
     if 'existing_city_id' not in st.session_state:
         st.session_state.existing_city_id = None
+    if 'analysis_point' not in st.session_state:
+        st.session_state.analysis_point = None
+    if 'show_analysis' not in st.session_state:
+        st.session_state.show_analysis = False
+    if 'analysis_radius' not in st.session_state:
+        st.session_state.analysis_radius = 1.0
 
 def render_header():
     """Render the application header."""
@@ -334,6 +362,8 @@ def clear_session_state():
     st.session_state.pending_state = None
     st.session_state.show_options = False
     st.session_state.existing_city_id = None
+    st.session_state.analysis_point = None
+    st.session_state.show_analysis = False
 
 def render_statistics():
     """Render statistics about the current city."""
@@ -457,11 +487,180 @@ def render_map():
             boundary_gdf,
             filtered_stores,
             use_clusters=True,
-            add_legend=True
+            add_legend=True,
+            analysis_point=st.session_state.analysis_point,
+            analysis_radius=st.session_state.analysis_radius
         )
         
-        # Display map
-        st_folium(m, width=1200, height=600, returned_objects=[])
+        # Display map and capture clicks
+        map_data = st_folium(
+            m, 
+            width=1200, 
+            height=600,
+            returned_objects=["last_clicked"],
+            key="main_map"  # Add key to prevent unnecessary reruns
+        )
+        
+        # Store clicked location
+        if map_data and map_data.get('last_clicked'):
+            new_lat = map_data['last_clicked']['lat']
+            new_lon = map_data['last_clicked']['lng']
+            
+            # Only update if coordinates changed significantly (to avoid re-runs on map panning)
+            # Use a larger threshold to prevent infinite loops
+            if (st.session_state.analysis_point is None or 
+                abs(st.session_state.analysis_point[0] - new_lat) > 0.001 or
+                abs(st.session_state.analysis_point[1] - new_lon) > 0.001):
+                
+                st.session_state.analysis_point = (new_lat, new_lon)
+                st.session_state.show_analysis = True
+                st.rerun()
+
+def render_accessibility_analysis():
+    """Render accessibility analysis section."""
+    if not st.session_state.data_loaded:
+        return
+    
+    stores_gdf = st.session_state.stores_gdf
+    
+    if stores_gdf is None or stores_gdf.empty:
+        return
+    
+    st.subheader("🎯 Accessibility Analysis")
+    
+    # Instructions
+    st.info("👆 **Click anywhere on the map below** to analyze food access at that location")
+    
+    # Analysis controls
+    col1, col2 = st.columns([1, 3])
+
+    with col1:
+        # Search radius slider
+        radius = st.slider(
+            "Search Radius (km)",
+            min_value=0.5,
+            max_value=5.0,
+            value=st.session_state.analysis_radius,
+            step=0.5,
+            help="Distance to search for nearby stores"
+        )
+        st.session_state.analysis_radius = radius
+
+    with col2:
+        # Show analysis results if point is selected
+        if st.session_state.analysis_point:
+            lat, lon = st.session_state.analysis_point
+            
+            st.write(f"**Analyzing location:** {lat:.6f}, {lon:.6f}")
+            
+            # Find nearest store
+            nearest = find_nearest_store((lat, lon), stores_gdf)
+            
+            # Count stores in radius
+            count = count_stores_in_radius((lat, lon), stores_gdf, radius)
+            
+            # Display results in columns
+            result_col1, result_col2, result_col3 = st.columns(3)
+
+            with result_col1:
+                if nearest:
+                    store_idx, distance = nearest
+                    store = stores_gdf.loc[store_idx]
+                    store_name = store['name'] if store['name'] else 'Unnamed Store'
+
+                    st.metric(
+                        label="Nearest Store",
+                        value=f"{distance:.2f} km",
+                        help=f"{store_name} ({store['shop_type'].replace('_', ' ').title()})"
+                    )
+                else:
+                    st.metric(label="Nearest Store", value="N/A")
+
+            with result_col2:
+                st.metric(
+                    label=f"Stores within {radius} km",
+                    value=count
+                )
+
+            with result_col3:
+                # Calculate walking time to nearest store (assuming 5 km/h)
+                if nearest:
+                    _, distance = nearest
+                    walking_time = (distance / 5.0) * 60  # minutes
+                    st.metric(
+                        label="Walking Time",
+                        value=f"{walking_time:.0f} min",
+                        help="To nearest store at 5 km/h"
+                    )
+                else:
+                    st.metric(
+                        label="Walking Time",
+                        value="N/A"
+                    )
+            
+            # Accessibility classification
+            st.divider()
+
+            if count == 0:
+                st.markdown(
+                    """
+                    <div class="accessibility-desert" style="color:black">
+                        <h4 style="color:black">🔴 Food Desert</h4>
+                        <p style="color:black">No grocery stores found within the search radius. This area has severely limited access to fresh food.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            elif count < 3:
+                st.markdown(
+                    """
+                    <div class="accessibility-limited" style="color:black">
+                        <h4 style="color:black">🟡 Limited Access</h4>
+                        <p style="color:black">Few grocery stores in the area. Residents may face challenges accessing fresh food options.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    """
+                    <div class="accessibility-good" style="color:black">
+                        <h4 style="color:black">🟢 Good Access</h4>
+                        <p style="color:black">Multiple grocery stores available within walking or short driving distance.</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            # Detailed store list
+            if count > 0:
+                with st.expander(f"📋 View all {count} nearby stores"):
+                    # Filter stores within radius
+                    from shapely.geometry import Point
+                    
+                    point = Point(lon, lat)
+                    radius_deg = radius / 111.0  # Rough conversion
+                    
+                    nearby_stores = []
+                    for idx, store in stores_gdf.iterrows():
+                        distance_deg = store.geometry.distance(point)
+                        if distance_deg <= radius_deg:
+                            distance_km = distance_deg * 111
+                            nearby_stores.append({
+                                'Name': store['name'] if store['name'] else 'Unnamed',
+                                'Type': store['shop_type'].replace('_', ' ').title(),
+                                'Distance (km)': round(distance_km, 2)
+                            })
+                    
+                    # Sort by distance
+                    nearby_stores.sort(key=lambda x: x['Distance (km)'])
+                    
+                    # Display as table
+                    import pandas as pd
+                    df = pd.DataFrame(nearby_stores)
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.write("**Click on the map to analyze a location**")
 
 def main():
     """Main application function."""
@@ -475,6 +674,8 @@ def main():
     # Main content
     if st.session_state.data_loaded:
         render_statistics()
+        st.divider()
+        render_accessibility_analysis()
         st.divider()
         render_map()
     else:

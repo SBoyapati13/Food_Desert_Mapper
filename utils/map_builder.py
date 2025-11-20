@@ -217,6 +217,73 @@ def add_stores_to_map(
         logger.error(traceback.format_exc())
         return map_obj
     
+def add_analysis_point_to_map(
+    map_obj: folium.Map,
+    point: Tuple[float, float],
+    radius_km: float
+) -> folium.Map:
+    """
+    Add accessibility analysis point and search radius to map.
+    
+    Args:
+        map_obj: Folium Map object
+        point: (latitude, longitude) tuple
+        radius_km: Search radius in kilometers
+        
+    Returns:
+        Updated Folium Map object
+    """
+    try:
+        lat, lon = point
+
+        # Add the analysis point marker
+        folium.Marker(
+            location=[lat, lon],
+            popup=folium.Popup(
+                f"""
+                <div style="font-family: Arial, sans-serif;">
+                    <h4 style="margin: 0 0 5px 0;">Analysis Point</h4>
+                    <p style="margin: 5px 0; font-size: 12px;">
+                        <b>Lat:</b> {lat:.6f}<br>
+                        <b>Lon:</b> {lon:.6f}<br>
+                        <b>Radius:</b> {radius_km} km
+                    </p>
+                </div>
+                """,
+                max_width=200
+            ),
+            tooltip="Click location (analysis point)",
+            icon=folium.Icon(
+                color='red',
+                icon='info-sign',
+                prefix='glyphicon'
+            )
+        ).add_to(map_obj)
+
+        # Add search radius circle
+        # Convert km to meters for accurate circle
+        radius_meters = radius_km * 1000
+        
+        folium.Circle(
+            location=[lat, lon],
+            radius=radius_meters,
+            color='#FF4444',
+            fill=True,
+            fillColor='#FF4444',
+            fillOpacity=0.1,
+            weight=2,
+            popup=f"Search radius: {radius_km} km",
+            tooltip=f"{radius_km} km radius"
+        ).add_to(map_obj)
+        
+        logger.info(f"Added analysis point at ({lat}, {lon}) with {radius_km} km radius")
+        return map_obj
+        
+    except Exception as e:
+        logger.error(f"Error adding analysis point to map: {e}")
+        logger.error(traceback.format_exc())
+        return map_obj
+
 def create_legend(store_types: List[str]) -> str:
     """
     Create HTML legend for store types.
@@ -328,16 +395,20 @@ def create_full_map(
     boundary_gdf: gpd.GeoDataFrame,
     stores_gdf: gpd.GeoDataFrame,
     use_clusters: bool = True,
-    add_legend: bool = True
+    add_legend: bool = True,
+    analysis_point: Optional[Tuple[float, float]] = None,
+    analysis_radius: float = 1.0
 ) -> folium.Map:
     """
-    Create a complete map with boundary and stores.
+    Create a complete map with boundary, stores, and optional analysis point.
     
     Args:
         boundary_gdf: GeoDataFrame with city boundary
         stores_gdf: GeoDataFrame with store locations
         use_clusters: Whether to use marker clustering
         add_legend: Whether to add a legend
+        analysis_point: Optional (lat, lon) tuple for accessibility analysis
+        analysis_radius: Radius for accessibility analysis in km
         
     Returns:
         Complete Folium Map object
@@ -366,7 +437,11 @@ def create_full_map(
         if boundary_gdf is not None and not boundary_gdf.empty:
             m = add_boundary_to_map(m, boundary_gdf)
         
-        # Add stores
+        # Add analysis point FIRST (so it appears under stores)
+        if analysis_point is not None:
+            m = add_analysis_point_to_map(m, analysis_point, analysis_radius)
+        
+        # Add stores (on top of analysis circle)
         if stores_gdf is not None and not stores_gdf.empty:
             m = add_stores_to_map(m, stores_gdf, use_clusters=use_clusters)
             
