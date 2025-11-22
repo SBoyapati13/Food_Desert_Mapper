@@ -10,6 +10,7 @@ from typing import Tuple, Optional, Union
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 from shapely.ops import unary_union
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +143,24 @@ def buffer_geometry(
     """
     try:
         if gdf is None or gdf.empty:
+            logger.warning("Empty GeoDataFrame provided for buffering")
             return gdf
         
+        # Create a copy to avoid modifying the original
+        gdf_copy = gdf.copy()
+        
+        # Ensure we're in WGS84 first
+        if gdf_copy.crs is None:
+            gdf_copy = gdf_copy.set_crs('EPSG:4326')
+        elif gdf_copy.crs != 'EPSG:4326':
+            gdf_copy = gdf_copy.to_crs('EPSG:4326')
+        
+        # Estimate UTM CRS for accurate buffering
+        utm_crs = gdf_copy.estimate_utm_crs()
+        logger.info(f"Using UTM CRS for buffering: {utm_crs}")
+        
         # Convert to projected CRS for accurate buffering
-        gdf_projected = gdf.to_crs(gdf.estimate_utm_crs())
+        gdf_projected = gdf_copy.to_crs(utm_crs)
         
         # Create buffer
         gdf_projected['geometry'] = gdf_projected.geometry.buffer(distance_meters)
@@ -153,9 +168,12 @@ def buffer_geometry(
         # Convert back to WGS84
         gdf_buffered = gdf_projected.to_crs('EPSG:4326')
         
+        logger.info(f"Created buffer of {distance_meters}m around {len(gdf)} geometries")
         return gdf_buffered
+        
     except Exception as e:
         logger.error(f"Error buffering geometry: {e}")
+        logger.error(traceback.format_exc())
         return gdf
     
 def merge_geometries(gdf: gpd.GeoDataFrame) -> Optional[Union[Polygon, MultiPolygon]]:
@@ -206,22 +224,21 @@ def find_nearest_store(
         # Create Point geometry
         point_geom = Point(point[1], point[0])  # Point(lon, lat)
         
-        # Calculate distances
-        distances = stores_gdf.geometry.distance(point_geom)
+        # Calculate distances using Haversine for accuracy
+        distances = []
+        for idx, store in stores_gdf.iterrows():
+            store_lat = store.geometry.y
+            store_lon = store.geometry.x
+            dist = calculate_distance(point, (store_lat, store_lon))
+            distances.append((idx, dist))
         
         # Find minimum
-        min_idx = distances.idxmin()
-        min_distance = distances.loc[min_idx]
+        if not distances:
+            return None
         
-        # Convert index to int if it's not already
-        if not isinstance(min_idx, int):
-            min_idx = int(min_idx)
+        min_item = min(distances, key=lambda x: x[1])
+        return min_item
         
-        # Convert to kilometers (rough approximation)
-        # 1 degree ≈ 111 km at equator
-        distance_km = min_distance * 111
-        
-        return (min_idx, round(distance_km, 2))
     except Exception as e:
         logger.error(f"Error finding nearest store: {e}")
         return None
@@ -246,19 +263,17 @@ def count_stores_in_radius(
         if stores_gdf is None or stores_gdf.empty:
             return 0
         
-        # Create Point geometry
-        point_geom = Point(point[1], point[0])  # Point(lon, lat)
+        # Count stores within radius using Haversine distance
+        count = 0
+        for idx, store in stores_gdf.iterrows():
+            store_lat = store.geometry.y
+            store_lon = store.geometry.x
+            dist = calculate_distance(point, (store_lat, store_lon))
+            if dist <= radius_km:
+                count += 1
         
-        # Convert radius to degrees (rough approximation)
-        radius_deg = radius_km / 111.0
+        return count
         
-        # Calculate distances
-        distances = stores_gdf.geometry.distance(point_geom)
-        
-        # Count stores within radius
-        count = (distances <= radius_deg).sum()
-        
-        return int(count)
     except Exception as e:
         logger.error(f"Error counting stores in radius: {e}")
         return 0
@@ -304,6 +319,87 @@ def reproject_to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     except Exception as e:
         logger.error(f"Error reprojecting to WGS84: {e}")
         return gdf
+
+def calculate_coverage_percentage(
+    stores_gdf: gpd.GeoDataFrame,
+    boundary_gdf: gpd.GeoDataFrame,
+    radius_meters: float
+) -> dict:
+    """
+    Calculate what percentage of a city is within walking distance of stores.
+    
+    Args:
+        stores_gdf: GeoDataFrame with store locations
+        boundary_gdf: GeoDataFrame with city boundary
+        radius_meters: Walking distance radius in meters
+        
+    Returns:
+        Dictionary with coverage statistics
+    """
+    default_result = {
+        'covered_area_km2': 0.0,
+        'total_area_km2': 0.0,
+        'coverage_percentage': 0.0,
+        'uncovered_area_km2': 0.0
+    }
+    
+    try:
+        if stores_gdf is None or stores_gdf.empty:
+            return default_result
+        
+        if boundary_gdf is None or boundary_gdf.empty:
+            return default_result
+        
+        # Create buffers around stores
+        buffered_stores = buffer_geometry(stores_gdf, radius_meters)
+        
+        # Merge all buffers
+        merged_buffers = unary_union(buffered_stores.geometry)
+        
+        # Get city boundary as a proper Shapely geometry
+        city_boundary_geom = boundary_gdf.geometry.iloc[0]
+        
+        # Ensure it's a valid Shapely geometry
+        if not isinstance(city_boundary_geom, (Polygon, MultiPolygon)):
+            logger.error(f"City boundary is not a valid geometry: {type(city_boundary_geom)}")
+            return default_result
+        
+        # Calculate intersection using Shapely directly
+        covered_area_geom = merged_buffers.intersection(city_boundary_geom)
+        
+        # Create GeoDataFrames with proper geometry lists
+        covered_gdf = gpd.GeoDataFrame(
+            {'id': [1]}, 
+            geometry=gpd.GeoSeries([covered_area_geom]), 
+            crs='EPSG:4326'
+        )
+        city_gdf = gpd.GeoDataFrame(
+            {'id': [1]}, 
+            geometry=gpd.GeoSeries([city_boundary_geom]), 
+            crs='EPSG:4326'
+        )
+        
+        utm_crs = covered_gdf.estimate_utm_crs()
+        covered_projected = covered_gdf.to_crs(utm_crs)
+        city_projected = city_gdf.to_crs(utm_crs)
+        
+        covered_area_km2 = covered_projected.geometry.area.iloc[0] / 1_000_000
+        total_area_km2 = city_projected.geometry.area.iloc[0] / 1_000_000
+        
+        coverage_pct = (covered_area_km2 / total_area_km2) * 100 if total_area_km2 > 0 else 0
+        
+        return {
+            'covered_area_km2': round(covered_area_km2, 2),
+            'total_area_km2': round(total_area_km2, 2),
+            'coverage_percentage': round(coverage_pct, 1),
+            'uncovered_area_km2': round(total_area_km2 - covered_area_km2, 2)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating coverage: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return default_result
     
 if __name__ == "__main__":
     """Test geometry utilities."""
@@ -339,3 +435,9 @@ if __name__ == "__main__":
     
     crs_valid = validate_crs(sample_gdf)
     print(f"  CRS valid: {crs_valid}")
+    
+    # Test buffer
+    print("\nBuffer Test:")
+    buffered = buffer_geometry(sample_gdf, 1000)  # 1km buffer
+    print(f"  Created {len(buffered)} buffered geometries")
+    print(f"  Buffer type: {type(buffered.geometry.iloc[0])}")

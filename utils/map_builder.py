@@ -16,6 +16,8 @@ import geopandas as gpd
 from shapely.geometry import Polygon, MultiPolygon
 from branca.element import MacroElement
 from jinja2 import Template
+import geopandas as gpd
+from shapely.ops import unary_union
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -217,6 +219,71 @@ def add_stores_to_map(
         logger.error(traceback.format_exc())
         return map_obj
     
+def add_walkability_buffers_to_map(
+        map_obj: folium.Map,
+        walkability_gdf: gpd.GeoDataFrame,
+        radius_km: float
+) -> folium.Map:
+    """
+    Add walkability buffer zones to map.
+    
+    Args:
+        map_obj: Folium Map object
+        walkability_gdf: GeoDataFrame with buffered store geometries
+        radius_km: Buffer radius in kilometers (for labeling)
+        
+    Returns:
+        Updated Folium Map object
+    """
+    try:
+        if walkability_gdf is None or walkability_gdf.empty:
+            logger.warning("Empty walkability GeoDataFrame")
+            return map_obj
+        
+        # Create a copy to avoid modifying the original
+        buffer_copy = walkability_gdf.copy()
+        
+        # Merge all buffers into a single geometry for cleaner visualization
+        merged_geometry = unary_union(buffer_copy.geometry)
+        
+        # Create a GeoDataFrame with the merged geometry
+        merged_gdf = gpd.GeoDataFrame(
+            geometry=[merged_geometry], 
+            crs=buffer_copy.crs
+        )
+        
+        # Convert to GeoJSON
+        buffer_geojson = merged_gdf.to_json()
+        
+        # Calculate walking time for tooltip
+        walking_time = int((radius_km / 5.0) * 60)
+        
+        # Add to map with semi-transparent green
+        folium.GeoJson(
+            buffer_geojson,
+            name=f'Walkability Zones ({radius_km} km / {walking_time} min)',
+            style_function=lambda x: {
+                'fillColor': '#28a745',
+                'color': '#155724',
+                'weight': 2,
+                'fillOpacity': 0.2,
+                'dashArray': '5, 5'
+            },
+            tooltip=folium.Tooltip(
+                f"<b>Walkable Area</b><br>"
+                f"Distance: {radius_km} km<br>"
+                f"Walking time: ~{walking_time} min"
+            )
+        ).add_to(map_obj)
+        
+        logger.info(f"Added walkability buffers with {radius_km} km radius")
+        return map_obj
+        
+    except Exception as e:
+        logger.error(f"Error adding walkability buffers: {e}")
+        logger.error(traceback.format_exc())
+        return map_obj
+
 def add_analysis_point_to_map(
     map_obj: folium.Map,
     point: Tuple[float, float],
@@ -397,7 +464,9 @@ def create_full_map(
     use_clusters: bool = True,
     add_legend: bool = True,
     analysis_point: Optional[Tuple[float, float]] = None,
-    analysis_radius: float = 1.0
+    analysis_radius: float = 1.0,
+    walkability_gdf: Optional[gpd.GeoDataFrame] = None,
+    walkability_radius: float = 1.0
 ) -> folium.Map:
     """
     Create a complete map with boundary, stores, and optional analysis point.
@@ -409,6 +478,8 @@ def create_full_map(
         add_legend: Whether to add a legend
         analysis_point: Optional (lat, lon) tuple for accessibility analysis
         analysis_radius: Radius for accessibility analysis in km
+        walkability_gdf: Optional GeoDataFrame with walkability buffer geometries
+        walkability_radius: Radius used for walkability buffers in km
         
     Returns:
         Complete Folium Map object
@@ -437,7 +508,11 @@ def create_full_map(
         if boundary_gdf is not None and not boundary_gdf.empty:
             m = add_boundary_to_map(m, boundary_gdf)
         
-        # Add analysis point FIRST (so it appears under stores)
+        # Add walkability buffers FIRST (so they appear under everything else)
+        if walkability_gdf is not None and not walkability_gdf.empty:
+            m = add_walkability_buffers_to_map(m, walkability_gdf, walkability_radius)
+        
+        # Add analysis point (under stores but above buffers)
         if analysis_point is not None:
             m = add_analysis_point_to_map(m, analysis_point, analysis_radius)
         
