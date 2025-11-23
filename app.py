@@ -12,13 +12,19 @@ from datetime import datetime
 
 # Import modules
 from config import Config
-from city_fetcher import fetch_city_boundary, get_boundary_info, US_STATES
+from city_fetcher import (
+    fetch_city_boundary, 
+    get_boundary_info, 
+    validate_boundary,
+    US_STATES
+)
 from grocery_fetcher import (
     fetch_grocery_stores,
     get_store_summary,
     get_unique_store_types,
     get_display_name,
-    filter_stores_by_type
+    filter_stores_by_type,
+    validate_stores
 )
 from db_setup import (
     check_city_exists,
@@ -304,6 +310,10 @@ def fetch_new_data(city: str, state: str):
             st.sidebar.error(f"Could not find boundary for {city}, {state}")
             return
         
+        if not validate_boundary(boundary_gdf):
+            st.sidebar.error("Invalid boundary geometry detected")
+            return
+        
         st.sidebar.success("✓ Boundary fetched")
     
     # Fetch stores
@@ -313,6 +323,9 @@ def fetch_new_data(city: str, state: str):
         if stores_gdf is None:
             st.sidebar.error("Failed to fetch grocery stores")
             return
+        
+        if not validate_stores(stores_gdf):
+            st.sidebar.warning("Some store data may be invalid")
         
         if stores_gdf.empty:
             st.sidebar.warning("No grocery stores found in this area")
