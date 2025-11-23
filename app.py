@@ -7,6 +7,7 @@ to fresh food sources by mapping grocery store locations.
 
 import streamlit as st
 import pandas as pd
+import geopandas as gpd
 import logging
 from datetime import datetime
 
@@ -38,6 +39,7 @@ from utils.validation import validate_city_name, validate_state_name, sanitize_i
 from utils.map_builder import create_full_map
 from utils.geo_utils import find_nearest_store, count_stores_in_radius, buffer_geometry, calculate_distance
 from streamlit_folium import st_folium
+from shapely import Point
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -138,6 +140,10 @@ def initialize_session_state():
         st.session_state.show_walkability_buffers = False
     if 'walkability_radius' not in st.session_state:
         st.session_state.walkability_radius = 1.0
+    if 'input_method' not in st.session_state:
+        st.session_state.input_method = "City Name"
+    if 'custom_location' not in st.session_state:
+        st.session_state.custom_location = None
 
 def render_header():
     """Render the application header."""
@@ -150,6 +156,40 @@ def render_sidebar():
     """Render the sidebar with city selection."""
     st.sidebar.header("📍 Select a City")
     
+    # Input method selection
+    input_method = st.sidebar.radio(
+        "Input Method",
+        ["City Name", "Coordinates"],
+        key="input_method_radio",
+        horizontal=True,
+        help="Choose how to specify the location"
+    )
+    st.session_state.input_method = input_method
+    
+    if input_method == "City Name":
+        render_city_input()
+    else:
+        render_coordinate_input()
+    
+    # Display current data info if loaded
+    if st.session_state.data_loaded and st.session_state.city_info:
+        st.sidebar.divider()
+        st.sidebar.subheader("📊 Current Data")
+        
+        info = st.session_state.city_info
+        st.sidebar.markdown(f"**City:** {info['name']}, {info['state']}")
+        st.sidebar.markdown(f"**Area:** {info['area_km2']:.2f} km²")
+        
+        if st.session_state.stores_gdf is not None:
+            st.sidebar.markdown(f"**Stores:** {len(st.session_state.stores_gdf)}")
+        
+        # Clear data button
+        if st.sidebar.button("🗑️ Clear Data", width='stretch'):
+            clear_session_state()
+            st.rerun()
+
+def render_city_input():
+    """Render city name input fields."""
     # City input
     city_input = st.sidebar.text_input(
         "City Name",
@@ -166,7 +206,7 @@ def render_sidebar():
     )
     
     # Fetch button
-    fetch_clicked = st.sidebar.button("🔍 Fetch City Data", type="primary", width="stretch")
+    fetch_clicked = st.sidebar.button("🔍 Fetch City Data", type="primary", width='stretch')
     
     # Process fetch request
     if fetch_clicked:
@@ -219,8 +259,8 @@ def render_sidebar():
             
             col1, col2 = st.sidebar.columns(2)
             
-            use_existing = col1.button("Use Existing", width="stretch", key="use_existing")
-            re_fetch = col2.button("Re-fetch", width="stretch", key="re_fetch")
+            use_existing = col1.button("Use Existing", width='stretch', key="use_existing")
+            re_fetch = col2.button("Re-fetch", width='stretch', key="re_fetch")
             
             if use_existing:
                 logger.info(f"Use Existing clicked for city_id: {st.session_state.existing_city_id}")
@@ -257,9 +297,184 @@ def render_sidebar():
             st.sidebar.markdown(f"**Stores:** {len(st.session_state.stores_gdf)}")
         
         # Clear data button
-        if st.sidebar.button("🗑️ Clear Data", width="stretch"):
+        if st.sidebar.button("🗑️ Clear Data", width='stretch'):
             clear_session_state()
             st.rerun()
+
+def render_coordinate_input():
+    """Render coordinate-based input fields."""
+    st.sidebar.info("ℹ️ Enter coordinates to fetch data for a custom area")
+    
+    # Latitude input
+    lat_input = st.sidebar.number_input(
+        "Latitude",
+        min_value=-90.0,
+        max_value=90.0,
+        value=39.9526 if st.session_state.custom_location is None else st.session_state.custom_location[0],
+        step=0.0001,
+        format="%.6f",
+        help="Latitude in decimal degrees (-90 to 90)"
+    )
+    
+    # Longitude input
+    lon_input = st.sidebar.number_input(
+        "Longitude",
+        min_value=-180.0,
+        max_value=180.0,
+        value=-75.1652 if st.session_state.custom_location is None else st.session_state.custom_location[1],
+        step=0.0001,
+        format="%.6f",
+        help="Longitude in decimal degrees (-180 to 180)"
+    )
+    
+    # Radius/buffer input for custom area
+    radius_km = st.sidebar.slider(
+        "Area Radius (km)",
+        min_value=1.0,
+        max_value=10.0,
+        value=3.0,
+        step=0.5,
+        help="Radius around the coordinates to fetch data"
+    )
+    
+    # Optional: Name for this custom location
+    location_name = st.sidebar.text_input(
+        "Location Name (optional)",
+        placeholder="e.g., My Neighborhood",
+        help="Give this location a custom name"
+    )
+    
+    # Fetch button
+    fetch_clicked = st.sidebar.button(
+        "🔍 Fetch Area Data", 
+        type="primary", 
+        use_container_width=True
+    )
+    
+    # Process fetch request
+    if fetch_clicked:
+        from utils.validation import validate_coordinates
+        
+        # Validate coordinates
+        if not validate_coordinates(lat_input, lon_input):
+            st.sidebar.error("Invalid coordinates")
+            return
+        
+        # Store custom location
+        st.session_state.custom_location = (lat_input, lon_input)
+        
+        # Fetch data for custom coordinates
+        fetch_coordinate_data(lat_input, lon_input, radius_km, location_name)
+        st.rerun()
+    
+    # Display current custom location if loaded
+    if st.session_state.data_loaded and st.session_state.custom_location:
+        st.sidebar.divider()
+        st.sidebar.subheader("📍 Current Location")
+        
+        lat, lon = st.session_state.custom_location
+        st.sidebar.markdown(f"**Coordinates:** {lat:.6f}, {lon:.6f}")
+        
+        if st.session_state.city_info:
+            info = st.session_state.city_info
+            if info.get('name'):
+                st.sidebar.markdown(f"**Area:** {info['name']}")
+            st.sidebar.markdown(f"**Area:** {info.get('area_km2', 0):.2f} km²")
+        
+        if st.session_state.stores_gdf is not None:
+            st.sidebar.markdown(f"**Stores:** {len(st.session_state.stores_gdf)}")
+
+def fetch_coordinate_data(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    location_name: str
+): 
+    """
+    Fetch grocery store data for a custom coordinate location.
+    
+    Args:
+        lat: Latitude in decimal degrees
+        lon: Longitude in decimal degrees
+        radius_km: Radius around the point to search (in km)
+        location_name: Optional custom name for the location
+    """
+    start_time = datetime.now()
+
+    try:
+        # Create a point geometry for the coordinates
+        with st.spinner(f"Creating search area around ({lat:.4f}, {lon:.4f})..."):
+            point = Point(lon, lat)  # Note: Point takes (x, y) = (lon, lat)
+            
+            # Create a GeoDataFrame with the point
+            point_gdf = gpd.GeoDataFrame(
+                {'geometry': [point]},
+                crs='EPSG:4326'
+            )
+            
+            # Create a buffer around the point (radius in km converted to meters)
+            boundary_gdf = buffer_geometry(point_gdf, radius_km * 1000)
+            
+            if boundary_gdf is None or boundary_gdf.empty:
+                st.sidebar.error("Failed to create search area")
+                return
+            
+            # Add metadata to the boundary
+            name = location_name if location_name else f"Custom Area ({lat:.4f}, {lon:.4f})"
+            boundary_gdf['name'] = name
+            boundary_gdf['state'] = 'Custom Location'
+            boundary_gdf['country'] = 'USA'
+            boundary_gdf['osm_id'] = 0  # No OSM ID for custom areas
+            
+            # Calculate area
+            utm_crs = boundary_gdf.estimate_utm_crs()
+            boundary_projected = boundary_gdf.to_crs(utm_crs)
+            area_m2 = boundary_projected.geometry.area.iloc[0]
+            area_km2 = area_m2 / 1_000_000
+            boundary_gdf['area_km2'] = round(area_km2, 2)
+            
+            st.sidebar.success("✓ Search area created")
+        
+        # Fetch stores within the buffered area
+        with st.spinner("Fetching grocery stores in the area..."):
+            stores_gdf = fetch_grocery_stores(boundary_gdf)
+            
+            if stores_gdf is None:
+                st.sidebar.error("Failed to fetch grocery stores")
+                return
+            
+            if stores_gdf.empty:
+                st.sidebar.warning("No grocery stores found in this area")
+            else:
+                st.sidebar.success(f"✓ Found {len(stores_gdf)} stores")
+        
+        # Note: For custom coordinate locations, we don't save to database
+        # as they don't correspond to official city boundaries
+        st.sidebar.info("ℹ️ Custom coordinate data is not saved to database")
+        
+        # Update session state
+        st.session_state.boundary_gdf = boundary_gdf
+        st.session_state.stores_gdf = stores_gdf
+        st.session_state.city_info = {
+            'name': name,
+            'state': 'Custom Location',
+            'country': 'USA',
+            'osm_id': 0,
+            'area_km2': area_km2,
+            'bbox': boundary_gdf.total_bounds,
+            'display_name': name,
+            'place_type': 'custom'
+        }
+        st.session_state.data_loaded = True
+        st.session_state.current_city = name
+        st.session_state.current_state = 'Custom'
+        
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Fetched coordinate data in {duration:.2f} seconds")
+        
+    except Exception as e:
+        st.sidebar.error(f"Error fetching coordinate data: {str(e)}")
+        logger.error(f"Exception in fetch_coordinate_data: {e}", exc_info=True)
 
 def load_existing_data(city_id: int):
     """Load existing data from database."""
@@ -373,6 +588,8 @@ def clear_session_state():
     st.session_state.show_analysis = False
     st.session_state.show_walkability_buffers = False
     st.session_state.walkability_radius = 1.0
+    st.session_state.input_method = "City Name"
+    st.session_state.custom_location = None
 
 def render_statistics():
     """Render statistics about the current city."""
