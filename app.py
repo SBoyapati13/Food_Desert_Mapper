@@ -6,6 +6,7 @@ to fresh food sources by mapping grocery store locations.
 """
 
 import streamlit as st
+import pandas as pd
 import logging
 from datetime import datetime
 
@@ -28,8 +29,8 @@ from db_setup import (
     log_fetch_metadata
 )
 from utils.validation import validate_city_name, validate_state_name, sanitize_input
-from utils.map_builder import create_full_map, add_analysis_point_to_map
-from utils.geo_utils import find_nearest_store, count_stores_in_radius, buffer_geometry
+from utils.map_builder import create_full_map
+from utils.geo_utils import find_nearest_store, count_stores_in_radius, buffer_geometry, calculate_distance
 from streamlit_folium import st_folium
 
 # Configure logging
@@ -159,7 +160,7 @@ def render_sidebar():
     )
     
     # Fetch button
-    fetch_clicked = st.sidebar.button("🔍 Fetch City Data", type="primary", use_container_width=True)
+    fetch_clicked = st.sidebar.button("🔍 Fetch City Data", type="primary", width="stretch")
     
     # Process fetch request
     if fetch_clicked:
@@ -212,8 +213,8 @@ def render_sidebar():
             
             col1, col2 = st.sidebar.columns(2)
             
-            use_existing = col1.button("Use Existing", use_container_width=True, key="use_existing")
-            re_fetch = col2.button("Re-fetch", use_container_width=True, key="re_fetch")
+            use_existing = col1.button("Use Existing", width="stretch", key="use_existing")
+            re_fetch = col2.button("Re-fetch", width="stretch", key="re_fetch")
             
             if use_existing:
                 logger.info(f"Use Existing clicked for city_id: {st.session_state.existing_city_id}")
@@ -250,7 +251,7 @@ def render_sidebar():
             st.sidebar.markdown(f"**Stores:** {len(st.session_state.stores_gdf)}")
         
         # Clear data button
-        if st.sidebar.button("🗑️ Clear Data", use_container_width=True):
+        if st.sidebar.button("🗑️ Clear Data", width="stretch"):
             clear_session_state()
             st.rerun()
 
@@ -644,17 +645,14 @@ def render_accessibility_analysis():
             # Detailed store list
             if count > 0:
                 with st.expander(f"📋 View all {count} nearby stores"):
-                    # Filter stores within radius
-                    from shapely.geometry import Point
-                    
-                    point = Point(lon, lat)
-                    radius_deg = radius / 111.0  # Rough conversion
-                    
                     nearby_stores = []
+                    
                     for idx, store in stores_gdf.iterrows():
-                        distance_deg = store.geometry.distance(point)
-                        if distance_deg <= radius_deg:
-                            distance_km = distance_deg * 111
+                        store_lat = store.geometry.y
+                        store_lon = store.geometry.x
+                        distance_km = calculate_distance((lat, lon), (store_lat, store_lon))
+                        
+                        if distance_km <= radius:
                             nearby_stores.append({
                                 'Name': store['name'] if store['name'] else 'Unnamed',
                                 'Type': store['shop_type'].replace('_', ' ').title(),
@@ -665,9 +663,8 @@ def render_accessibility_analysis():
                     nearby_stores.sort(key=lambda x: x['Distance (km)'])
                     
                     # Display as table
-                    import pandas as pd
                     df = pd.DataFrame(nearby_stores)
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.dataframe(df, width="stretch", hide_index=True)
         else:
             st.write("**Click on the map to analyze a location**")
 
